@@ -439,7 +439,8 @@ fn lzfse_compress(input: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn compress_kcbc(pixel_data: &[u8], height: u32) -> Option<Vec<u8>> {
+/// Returns the KCBC chunk stream and the number of chunks it holds.
+fn compress_kcbc(pixel_data: &[u8], height: u32) -> Option<(Vec<u8>, u32)> {
     if pixel_data.is_empty() || height == 0 {
         return None;
     }
@@ -454,6 +455,7 @@ fn compress_kcbc(pixel_data: &[u8], height: u32) -> Option<Vec<u8>> {
     };
     let mut out = Vec::new();
     let mut row = 0usize;
+    let mut chunks = 0u32;
     let total = height as usize;
     while row < total {
         let n = rows_per_chunk.min(total - row);
@@ -465,11 +467,12 @@ fn compress_kcbc(pixel_data: &[u8], height: u32) -> Option<Vec<u8>> {
         out.write_u32::<LittleEndian>(compressed.len() as u32).unwrap();
         out.extend_from_slice(&compressed);
         row += n;
+        chunks += 1;
         if row < total {
             out.extend_from_slice(b"KCBC");
         }
     }
-    Some(out)
+    Some((out, chunks))
 }
 
 fn gzip_compress(data: &[u8]) -> Option<Vec<u8>> {
@@ -512,13 +515,13 @@ pub fn compress_data(
 
     let lzfse_min = min_lzfse_version(platform);
     if deploy_ver >= lzfse_min && pixel_data.len() > 256 {
-        if let Some(kcbc) = compress_kcbc(pixel_data, height) {
+        if let Some((kcbc, chunks)) = compress_kcbc(pixel_data, height) {
             let celm_ver: u32 = if is_opaque { 3 } else { 1 };
             let mut out = Vec::new();
             out.extend_from_slice(b"MLEC");
             out.write_u32::<LittleEndian>(celm_ver).unwrap();
             out.write_u32::<LittleEndian>(4).unwrap();
-            out.write_u32::<LittleEndian>(3).unwrap();
+            out.write_u32::<LittleEndian>(chunks).unwrap();
             out.extend_from_slice(b"KCBC");
             out.extend_from_slice(&kcbc);
             return out;
