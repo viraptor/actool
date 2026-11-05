@@ -12,6 +12,7 @@ pub struct BomWriter {
     blocks: Vec<Vec<u8>>,
     named_blocks: IndexMap<String, usize>,
     inline_key_size: Option<usize>,
+    compact_variable_trees: bool,
 }
 
 impl BomWriter {
@@ -20,7 +21,15 @@ impl BomWriter {
             blocks: vec![Vec::new()], // block 0 is always empty
             named_blocks: IndexMap::new(),
             inline_key_size: None,
+            compact_variable_trees: false,
         }
+    }
+
+    /// Lay out variable-key trees (FACETKEYS, APPEARANCEKEYS) the way CoreUI
+    /// 1000+ catalogs do: key size recorded as 0xFFFFFFFF and the leaf kept at
+    /// exactly one block with no inline-key region.
+    pub fn set_compact_variable_trees(&mut self, compact: bool) {
+        self.compact_variable_trees = compact;
     }
 
     /// Set the fixed key size for subsequent `add_tree` calls. When set, the
@@ -57,9 +66,15 @@ impl BomWriter {
         // Variable-key trees (FACETKEYS, APPEARANCEKEYS) still carry an
         // inline-key region whose width equals the longest key in the tree;
         // CUICatalog reads that region when enumerating facets/appearances.
+        let compact = self.inline_key_size.is_none() && self.compact_variable_trees;
         let effective_key_size = self.inline_key_size.unwrap_or_else(|| {
             entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0)
         });
+        let (leaf_key_size, header_key_size) = if compact {
+            (None, u32::MAX)
+        } else {
+            (Some(effective_key_size), effective_key_size as u32)
+        };
 
         if entries.is_empty() {
             let mut node = Vec::with_capacity(block_size as usize);
@@ -70,7 +85,7 @@ impl BomWriter {
             node.resize(block_size as usize, 0);
             let node_idx = self.add_block(node);
             let tree_hdr =
-                build_tree_header(node_idx, block_size, 0, 0, effective_key_size as u32);
+                build_tree_header(node_idx, block_size, 0, 0, header_key_size);
             let tree_idx = self.add_block(tree_hdr);
             self.named_blocks.insert(name.to_string(), tree_idx);
             return tree_idx;
@@ -85,7 +100,7 @@ impl BomWriter {
                 0,
                 0,
                 block_size,
-                Some(effective_key_size),
+                leaf_key_size,
             );
             let node_idx = self.add_block(node);
             let tree_hdr = build_tree_header(
@@ -93,7 +108,7 @@ impl BomWriter {
                 block_size,
                 entries.len() as u32,
                 0,
-                effective_key_size as u32,
+                header_key_size,
             );
             let tree_idx = self.add_block(tree_hdr);
             self.named_blocks.insert(name.to_string(), tree_idx);
@@ -113,7 +128,7 @@ impl BomWriter {
                 0
             };
             let bwd = if i > 0 { leaf_indices[i - 1] as u32 } else { 0 };
-            let node = self.build_leaf_node(batch, fwd, bwd, block_size, Some(effective_key_size));
+            let node = self.build_leaf_node(batch, fwd, bwd, block_size, leaf_key_size);
             self.blocks[leaf_indices[i]] = node;
         }
 
@@ -141,7 +156,7 @@ impl BomWriter {
             block_size,
             entries.len() as u32,
             0,
-            effective_key_size as u32,
+            header_key_size,
         );
         let tree_idx = self.add_block(tree_hdr);
         self.named_blocks.insert(name.to_string(), tree_idx);
@@ -499,5 +514,23 @@ mod tests {
             .expect("THIRD not found");
         assert!(first < second);
         assert!(second < third);
+    }
+
+    #[test]
+    fn compact_variable_tree_records_unset_key_size_and_one_block_leaf() {
+        let entries = vec![(b"alpha".to_vec(), vec![1u8]), (b"beta-longer".to_vec(), vec![2u8])];
+        let mut compact = BomWriter::new();
+        compact.set_compact_variable_trees(true);
+        let tree = compact.add_tree("T", &entries, 4096);
+        // Header: "tree", version, root, block size, path count, flag, key size.
+        assert_eq!(&compact.blocks[tree][21..25], &u32::MAX.to_be_bytes());
+        let root = u32::from_be_bytes(compact.blocks[tree][8..12].try_into().unwrap()) as usize;
+        assert_eq!(compact.blocks[root].len(), 4096);
+
+        let mut padded = BomWriter::new();
+        let tree = padded.add_tree("T", &entries, 4096);
+        assert_eq!(&padded.blocks[tree][21..25], &11u32.to_be_bytes());
+        let root = u32::from_be_bytes(padded.blocks[tree][8..12].try_into().unwrap()) as usize;
+        assert_eq!(padded.blocks[root].len(), 4096 + 2 * 11);
     }
 }
