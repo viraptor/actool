@@ -184,11 +184,25 @@ impl GradientFill {
     /// across the content rect). Used to reproduce the colour a frosted-glass
     /// layer multiplies, since the gradient is drawn under the layer stack.
     pub fn sample(&self, x: u32, y: u32, pixel_size: u32) -> [f64; 3] {
-        let margin = pixel_size as f64 * MARGIN_RATIO;
+        self.sample_with_margin(x, y, pixel_size, MARGIN_RATIO)
+    }
+
+    /// As [`sample`](Self::sample), for a content rect inset by `margin_ratio`
+    /// of the canvas on each side (0 for full-bleed iOS icons).
+    pub fn sample_with_margin(
+        &self,
+        x: u32,
+        y: u32,
+        pixel_size: u32,
+        margin_ratio: f64,
+    ) -> [f64; 3] {
+        let margin = pixel_size as f64 * margin_ratio;
         let content = (pixel_size as f64 - 2.0 * margin).max(1.0);
         // Normalize the pixel into the content rect, matching `to_ctx`.
         let nx = (x as f64 + 0.5 - margin) / content;
-        let ny = (y as f64 + 0.5 - margin) / content;
+        // Pixel rows run top-down but `composite_icon` draws in a bottom-up
+        // CoreGraphics context, where the gradient's first stop sits at high y.
+        let ny = 1.0 - (y as f64 + 0.5 - margin) / content;
         let (sx, sy) = (self.start[0] as f64, self.start[1] as f64);
         let (ex, ey) = (self.stop[0] as f64, self.stop[1] as f64);
         let (dx, dy) = (ex - sx, ey - sy);
