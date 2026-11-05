@@ -203,7 +203,11 @@ fn main() -> ExitCode {
     // Dispatch to icon bundle handler when there is exactly one document and it
     // is a .icon bundle; otherwise compile all provided asset catalogs together.
     let output_files = if documents.len() == 1 && icon_bundle::is_icon_bundle(&documents[0]) {
-        match icon_bundle::compile_icon_bundle(
+        let options = icon_bundle::IconCompileOptions {
+            coreui_version: Some(compiler::resolve_coreui_version(&cli.platform, cli.coreui_version)),
+            target_devices: cli.target_device.iter().filter(|d| !d.is_empty()).cloned().collect(),
+        };
+        match icon_bundle::compile_icon_bundle_with_options(
             &documents[0],
             &compile_dir,
             &cli.platform,
@@ -212,10 +216,15 @@ fn main() -> ExitCode {
             cli.output_partial_info_plist.as_deref(),
             cli.accent_color.as_deref(),
             &cli.standalone_icon_behavior,
+            &options,
         ) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("error compiling icon bundle: {e}");
+                if let Some(missing) = e.downcast_ref::<icon_bundle::NoMatchingAppIcon>() {
+                    print_compilation_error(&cli.output_format, &missing.document, &missing.to_string(), &missing.output_files);
+                } else {
+                    eprintln!("error compiling icon bundle: {e}");
+                }
                 return ExitCode::from(1);
             }
         }
@@ -284,6 +293,48 @@ fn print_version(format: &str) {
 fn print_plist_xml(_top_key: &str, _body: &str) {
     // Minimal stub — full --print-contents implementation is out of scope
     // of the rewrite's first milestone.
+}
+
+/// actool's report for a failed compile: the error plus whatever outputs were
+/// still written (the partial plist).
+fn print_compilation_error(
+    format: &str,
+    document: &Path,
+    message: &str,
+    output_files: &[PathBuf],
+) {
+    if format == "human-readable-text" {
+        println!("/* com.apple.actool.errors */");
+        println!("{}: error: {message}", document.display());
+        println!("/* com.apple.actool.compilation-results */");
+        for f in output_files {
+            println!("{}", f.display());
+        }
+        println!();
+        return;
+    }
+    println!(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    println!(r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#);
+    println!(r#"<plist version="1.0">"#);
+    println!("<dict>");
+    println!("\t<key>com.apple.actool.compilation-results</key>");
+    println!("\t<dict>");
+    println!("\t\t<key>output-files</key>");
+    println!("\t\t<array>");
+    for f in output_files {
+        println!("\t\t\t<string>{}</string>", f.display());
+    }
+    println!("\t\t</array>");
+    println!("\t</dict>");
+    println!("\t<key>com.apple.actool.errors</key>");
+    println!("\t<array>");
+    println!("\t\t<dict>");
+    println!("\t\t\t<key>description</key>");
+    println!("\t\t\t<string>{message}</string>");
+    println!("\t\t</dict>");
+    println!("\t</array>");
+    println!("</dict>");
+    println!("</plist>");
 }
 
 fn print_compilation_results(format: &str, output_files: &[PathBuf]) {

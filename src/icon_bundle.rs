@@ -122,6 +122,16 @@ pub fn is_icon_bundle(path: &Path) -> bool {
     path.extension().and_then(|s| s.to_str()) == Some("icon")
 }
 
+/// CoreUI version at which Apple names the stock light/dark background
+/// gradients `system-light`/`system-dark` instead of `Gradient-N`. Observed on
+/// 1011 (Xcode 26); 975-era references use `Gradient-N`.
+const SYSTEM_GRADIENT_NAMES_MIN_COREUI: u32 = 1000;
+
+/// Lowest CoreUI version whose IconComposer code paths accept `.icon` catalogs.
+const MIN_ICON_COREUI: u32 = 975;
+
+/// Compile with the baseline (975-era) output; deterministic regardless of the
+/// installed toolchain.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_icon_bundle(
     icon_path: &Path,
@@ -133,6 +143,65 @@ pub fn compile_icon_bundle(
     accent_color: Option<&str>,
     standalone_icon_behavior: &str,
 ) -> Result<Vec<PathBuf>> {
+    compile_icon_bundle_with_options(
+        icon_path,
+        output_dir,
+        platform,
+        min_deploy,
+        app_icon,
+        info_plist_path,
+        accent_color,
+        standalone_icon_behavior,
+        &IconCompileOptions::default(),
+    )
+}
+
+/// Toolchain-dependent inputs to an icon-bundle compile.
+#[derive(Debug, Clone, Default)]
+pub struct IconCompileOptions {
+    /// CoreUI version of the toolchain being emulated (header version and
+    /// version-dependent layout); `None` is the 975-era baseline.
+    pub coreui_version: Option<u32>,
+    /// `--target-device` values; empty means every device.
+    pub target_devices: Vec<String>,
+}
+
+/// iOS refuses an `--app-icon` that doesn't name the bundle, where macOS
+/// quietly emits an empty plist. Carries what actool still prints.
+#[derive(Debug)]
+pub struct NoMatchingAppIcon {
+    pub name: String,
+    pub document: PathBuf,
+    pub output_files: Vec<PathBuf>,
+}
+
+impl std::fmt::Display for NoMatchingAppIcon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "None of the input catalogs contained a matching stickers icon set, app icon set, or icon stack named  \"{}\".",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for NoMatchingAppIcon {}
+
+/// Like [`compile_icon_bundle`], matching the toolchain described by `options`.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_icon_bundle_with_options(
+    icon_path: &Path,
+    output_dir: &Path,
+    platform: &str,
+    min_deploy: &str,
+    app_icon: Option<&str>,
+    info_plist_path: Option<&Path>,
+    accent_color: Option<&str>,
+    standalone_icon_behavior: &str,
+    options: &IconCompileOptions,
+) -> Result<Vec<PathBuf>> {
+    let coreui_version = options.coreui_version;
+    let coreui_version = coreui_version.unwrap_or(MIN_ICON_COREUI).max(MIN_ICON_COREUI);
     fs::create_dir_all(output_dir)?;
     let bundle_stem = icon_path
         .file_stem()
@@ -142,6 +211,21 @@ pub fn compile_icon_bundle(
     // --app-icon controls the .icns filename and Info.plist value, but
     // Apple's actool always names the in-CAR facet after the bundle stem.
     let icon_name = app_icon.map(|s| s.to_string()).unwrap_or(bundle_stem.clone());
+
+    let ios_platform = matches!(platform, "iphoneos" | "iphonesimulator");
+    if ios_platform && icon_name != bundle_stem {
+        let mut output_files = Vec::new();
+        if let Some(path) = info_plist_path {
+            write_empty_partial_plist(path)?;
+            output_files.push(fs::canonicalize(path).unwrap_or(path.to_path_buf()));
+        }
+        return Err(NoMatchingAppIcon {
+            name: icon_name,
+            document: fs::canonicalize(icon_path).unwrap_or(icon_path.to_path_buf()),
+            output_files,
+        }
+        .into());
+    }
 
     let icon_json_path = icon_path.join("icon.json");
     let icon_json_text = fs::read_to_string(&icon_json_path).map_err(|e| {
@@ -194,9 +278,12 @@ pub fn compile_icon_bundle(
             })
             .collect()
     };
-    let (color_assets, gradient_assets) =
+    let (color_assets, mut gradient_assets) =
         fill_assets(&facet_prefix, parsed.fill.as_ref(), &parsed)
             .unwrap_or_else(|| (Vec::new(), Vec::new()));
+    if coreui_version >= SYSTEM_GRADIENT_NAMES_MIN_COREUI {
+        name_system_gradients(&facet_prefix, &color_assets, &mut gradient_assets);
+    }
 
     let mut output_files: Vec<PathBuf> = Vec::new();
 
@@ -283,16 +370,30 @@ pub fn compile_icon_bundle(
     // between light and dark. The primary variant uses the light stack, the
     // alternate (when the variant axis is active) the dark stack.
     use crate::icon_effects::Appearance;
-    let light_layers = collect_stack_layers(icon_path, &parsed, Appearance::Light);
-    let dark_layers = collect_stack_layers(icon_path, &parsed, Appearance::Dark);
+    // iOS icons are full-bleed: layers and the gradient span the whole canvas,
+    // where macOS insets them into the 824/1024 content box.
+    let ios = matches!(platform, "iphoneos" | "iphonesimulator");
+    let base_scale = if ios { 1.0 } else { LAYER_BASE_SCALE };
+    let light_layers = collect_stack_layers(icon_path, &parsed, Appearance::Light, base_scale);
+    let dark_layers = collect_stack_layers(icon_path, &parsed, Appearance::Dark, base_scale);
     // Frosted-glass layers multiply the background gradient, so the stack
     // renderer needs the same fill the compositor will draw under it. The
     // solid-fill case uses the flat solid colour for the light background.
     let (light_fill, dark_fill) =
-        resolve_background_fills(&parsed, &gradient_assets, &color_assets);
+        resolve_background_fills(&parsed, &gradient_assets, &color_assets, base_scale);
     let mut light_stacks: Vec<Vec<u8>> = Vec::with_capacity(MACOS_ICON_SIZES.len());
     let mut dark_stacks: Vec<Vec<u8>> = Vec::with_capacity(MACOS_ICON_SIZES.len());
-    for (point_size, scale) in MACOS_ICON_SIZES {
+    let ios_images = if ios {
+        Some(render_ios_composites(
+            &light_layers,
+            &dark_layers,
+            light_fill.as_ref(),
+            dark_fill.as_ref().or(light_fill.as_ref()),
+        )?)
+    } else {
+        None
+    };
+    for (point_size, scale) in MACOS_ICON_SIZES.iter().filter(|_| !ios) {
         let px = point_size * scale;
         light_stacks.push(render_layer_stack(&light_layers, px, light_fill.as_ref())?);
         if emit_variant_axis {
@@ -318,6 +419,8 @@ pub fn compile_icon_bundle(
         emit_variant_axis,
         platform,
         min_deploy,
+        coreui_version,
+        ios_images.as_deref(),
     )?;
     output_files.push(fs::canonicalize(&car_path).unwrap_or(car_path));
 
@@ -327,9 +430,13 @@ pub fn compile_icon_bundle(
     // Verified by toggling the stem against the flag — neither
     // `supported-platforms` nor `--standalone-icon-behavior` affects this.
     let names_match = icon_name == bundle_stem;
-    if names_match {
+    if let Some(images) = ios_images.as_ref().filter(|_| names_match) {
+        output_files.extend(write_ios_home_screen_icons(&icon_name, images, output_dir)?);
+    } else if names_match && !ios {
         let icns_path = output_dir.join(format!("{icon_name}.icns"));
-        crate::icns::create_icns(&icon_images, &icns_path)?;
+        let icns_images =
+            composite_icns_sources(&icon_images, &light_stacks, light_fill.as_ref(), &tmpdir)?;
+        crate::icns::create_icns(&icns_images, &icns_path)?;
         if icns_path.exists() {
             output_files.push(fs::canonicalize(&icns_path).unwrap_or(icns_path));
         }
@@ -340,7 +447,19 @@ pub fn compile_icon_bundle(
     let _ = standalone_icon_behavior;
 
     if let Some(path) = info_plist_path {
-        if names_match {
+        if names_match && ios {
+            let targets = |d: &str| {
+                options.target_devices.is_empty()
+                    || options.target_devices.iter().any(|t| t == d)
+            };
+            crate::compiler::write_ios_icon_plist_files(
+                path,
+                &icon_name,
+                &[format!("{icon_name}60x60")],
+                &[format!("{icon_name}60x60"), format!("{icon_name}76x76")],
+                (targets("iphone"), targets("ipad")),
+            )?;
+        } else if names_match {
             write_populated_partial_plist(path, &icon_name)?;
         } else {
             write_empty_partial_plist(path)?;
@@ -598,18 +717,19 @@ fn collect_stack_layers(
     bundle: &Path,
     parsed: &IconJson,
     appearance: crate::icon_effects::Appearance,
+    base_scale: f32,
 ) -> Vec<StackLayer> {
     use crate::icon_effects::resolve_icon_effects;
     let mut out = Vec::new();
     for group in &parsed.groups {
         let eff = resolve_icon_effects(group, appearance);
-        // A "glass context" — the group has translucency/blur enabled or any
+        // A "glass context" — the group has blur enabled or any
         // sibling layer is glass — makes every layer render as glass unless it
         // explicitly opts out (`glass: false`). scrumdinger's middle layer
         // omits `glass` yet Apple still frosts it.
-        let glass_context = eff.translucency.enabled
-            || eff.blur_material.is_some()
-            || eff.layers.iter().any(|l| l.glass);
+        // Translucency alone does not: Chimera/srb2-legacy enable it with no
+        // glass layer and Apple renders their art flat.
+        let glass_context = eff.blur_material.is_some() || eff.layers.iter().any(|l| l.glass);
         let (gscale, gtx, gty) = group
             .position
             .as_ref()
@@ -648,7 +768,10 @@ fn collect_stack_layers(
             // (see-through), disabled → opaque, with a specular sheen when the
             // group's specular is on (KYA's cup).
             let is_glass = explicit || (glass_context && !opted_out);
-            let frosted = is_glass && eff.translucency.enabled;
+            // Apple keeps colour bitmap glass layers crisp even with translucency
+            // on (srb2: `glass: true`, translucency 0.3 → unblurred art in both
+            // CAR and ICNS); the relief look was only measured on vector glyphs.
+            let frosted = is_glass && eff.translucency.enabled && is_svg_path(&path);
             let tinted = frosted
                 && eff.shadow.kind == crate::icon_effects::ShadowKind::LayerColor;
             let specular = is_glass && !eff.translucency.enabled && eff.specular;
@@ -672,9 +795,9 @@ fn collect_stack_layers(
                 tinted,
                 specular,
                 shadow_strength,
-                scale: LAYER_BASE_SCALE * gscale * lscale,
-                tx: LAYER_BASE_SCALE * (gscale * ltx + gtx),
-                ty: LAYER_BASE_SCALE * (gscale * lty + gty),
+                scale: base_scale * gscale * lscale,
+                tx: base_scale * (gscale * ltx + gtx),
+                ty: base_scale * (gscale * lty + gty),
                 opacity,
                 blend,
                 native_w,
@@ -710,14 +833,66 @@ fn rasterize_layer(path: &Path, w: u32, h: u32) -> Result<Vec<u8>> {
         }
         Ok(rgba)
     } else {
-        let img = image::open(path)?.to_rgba8();
-        let resized = image::imageops::resize(&img, w, h, FilterType::Lanczos3);
+        let mut img = image::open(path)?.to_rgba8();
+        // Resample in premultiplied space: the RGB of transparent pixels is
+        // arbitrary (often white) and would bleed into the antialiased edge.
+        for p in img.pixels_mut() {
+            let a = p[3] as u32;
+            for c in 0..3 {
+                p[c] = ((p[c] as u32 * a + 127) / 255) as u8;
+            }
+        }
+        let mut resized = image::imageops::resize(&img, w, h, FilterType::Lanczos3);
+        for p in resized.pixels_mut() {
+            let a = p[3] as u32;
+            if a == 0 {
+                continue;
+            }
+            for c in 0..3 {
+                p[c] = ((p[c] as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
         Ok(resized.into_raw())
     }
 }
 
 /// The layer source's native point size (SVG viewBox / raster dimensions),
 /// used to render it at the right aspect inside the 1024-pt canvas.
+/// Per-group data for the iconstack/IconGroup renditions, resolved once per
+/// appearance family (dark vs everything else).
+struct GroupInfo {
+    ident: u16,
+    light_refs: Vec<car::LayerRef>,
+    dark_refs: Vec<car::LayerRef>,
+    light_style: car::GroupStyle,
+    dark_style: car::GroupStyle,
+}
+
+/// A layer's placement on the 1024pt canvas as Apple records it in the
+/// IconGroup: native size scaled by group × layer scale, centred and shifted by
+/// the translations. Offsets floor and sizes round (srb2: 746×734 at 1.4 →
+/// x −11, y −2, 1044×1028).
+fn layer_canvas_frame(
+    group: &crate::icon_json::Group,
+    layer: &crate::icon_json::Layer,
+    source: &Path,
+) -> (i32, i32, u32, u32) {
+    let placement = |p: Option<&crate::icon_json::Position>| {
+        p.map(|p| {
+            let t = p.translation_in_points.unwrap_or([0.0, 0.0]);
+            (p.scale.unwrap_or(1.0), t[0], t[1])
+        })
+        .unwrap_or((1.0, 0.0, 0.0))
+    };
+    let (gs, gtx, gty) = placement(group.position.as_ref());
+    let (ls, ltx, lty) = placement(layer.position.as_ref());
+    let (nw, nh) = layer_native_size(source);
+    let (w, h) = (nw as f32 * gs * ls, nh as f32 * gs * ls);
+    let x = 512.0 + gs * ltx + gtx - w / 2.0;
+    let y = 512.0 + gs * lty + gty - h / 2.0;
+    (x.floor() as i32, y.floor() as i32, w.round() as u32, h.round() as u32)
+}
+
 fn layer_native_size(path: &Path) -> (u32, u32) {
     if is_svg_path(path) {
         if let Ok(svg) = fs::read(path) {
@@ -1093,6 +1268,8 @@ fn build_icon_car(
     emit_variant_axis: bool,
     platform: &str,
     min_deploy: &str,
+    coreui_version: u32,
+    ios_images: Option<&[IosComposite]>,
 ) -> Result<()> {
     let ident = hash_name(icon_name);
     // The actual keyformat is computed from the renditions below — only the
@@ -1121,237 +1298,279 @@ fn build_icon_car(
     // instead, in `render_layer_stack`.) A fixed neutral spec at opacity 0.5
     // reproduces Apple's halo (`shadow_geometry` tuned to it).
     use crate::icon_effects::{ShadowKind, ShadowSpec};
-    let _ = groups;
     let icon_shadow = Some(ShadowSpec { kind: ShadowKind::Neutral, opacity: 0.5 });
     let light_shadow = icon_shadow;
     let dark_shadow = icon_shadow;
 
-    // Split images into atlas candidates (small sizes) and inline (large).
-    // For each size load BGRA pixels, then dispatch by point size. When
-    // `emit_variant_axis` is set, every sized rendition is duplicated for
-    // the alternate variant (same pixels — the variant axis is structural;
-    // CUICatalog reads it to pick which alternate to display per-appearance).
-    for (idx, (img_path, pixel_size, scale)) in icon_images.iter().enumerate() {
-        let point_size = pixel_size / scale;
-        let dim2 = icon_dim2(point_size);
-        for &variant in variants {
-            // Use the pre-rendered multi-layer stack for this size and variant
-            // (the alternate variant has its own dark-appearance stack); fall
-            // back to the primary layer if absent.
-            let stacks = if variant == 1 && !dark_stacks.is_empty() {
-                dark_stacks
-            } else {
-                light_stacks
-            };
-            let (layer_bgra, w, h) = match stacks.get(idx) {
-                Some(stack) if stack.len() == (pixel_size * pixel_size * 4) as usize => {
-                    (stack.clone(), *pixel_size, *pixel_size)
-                }
-                _ => {
-                    let (b, w, h, _pf) = load_image_as_bgra(img_path, true)?;
-                    (b, w, h)
-                }
-            };
-            // Composite the layer over the variant's background gradient,
-            // clipped to the squircle. The alternate variant uses the dark
-            // gradient when present.
-            let fill = if variant == 1 {
-                dark_fill.or(light_fill)
-            } else {
-                light_fill
-            };
-            let shadow = shadow_params(
-                if variant == 1 { dark_shadow } else { light_shadow },
-                *pixel_size,
-            );
-            let composited = match fill {
-                Some(f) => crate::icon_render::composite_icon(
-                    *pixel_size,
-                    f,
-                    &layer_bgra,
-                    shadow.as_ref(),
-                )
-                .unwrap_or_else(|| layer_bgra.clone()),
-                None => layer_bgra.clone(),
-            };
-            // With the variant axis the composite is stored as a grayscale
-            // image (variant 0 → GA8 cspace 2, variant 1 → GA16 cspace 6);
-            // otherwise it stays BGRA.
-            let (pd, pf, cs_id): (Vec<u8>, [u8; 4], u32) = if emit_variant_axis {
-                if variant == 0 {
-                    (crate::catalog::bgra_to_ga8_force(&composited), *b" 8AG", 2)
-                } else {
-                    // The dark (alternate) variant is NOT a baked dark composite
-                    // — Apple stores a flat near-white squircle tint that
-                    // CUICatalog composites over the light icon. Build that tint
-                    // (premult gray 59 / α 60 over the squircle, plus the icon's
-                    // black drop shadow) instead of the dark composite.
-                    let dark = fill
-                        .and_then(|f| {
-                            build_dark_variant_tint(*pixel_size, f, shadow.as_ref())
-                        })
-                        .unwrap_or_else(|| composited.clone());
-                    (crate::catalog::bgra_to_ga16_force(&dark), *b"61AG", 6)
-                }
-            } else {
-                (composited, *b"BGRA", car::colorspace_for_pixel_format(b"BGRA"))
-            };
-            let name = pre_rendered_name(
-                icon_name,
-                point_size,
-                *scale,
-                "NSAppearanceNameSystem",
-            );
-            if ATLAS_POINT_SIZES.contains(&point_size) {
-                let mut pi = crate::packer::PackedImage::new(
-                    name.clone(),
-                    ident as u32,
-                    w,
-                    h,
-                );
-                pi.pixel_data = pd;
-                pi.pixel_format = pf;
-                pi.scale = *scale;
-                pi.part = car::PART_ICON as u32;
-                pi.dim2 = dim2 as u32;
-                pi.variant = variant as u32;
-                packed_imgs_per_variant[variant as usize].push(pi);
-            } else {
+    if let Some(images) = ios_images {
+        // iOS stores one full-bleed 1024pt composite per idiom and appearance,
+        // plus a single-entry multisize rendition per idiom (size index 1).
+        for idiom in [1u16, 2] {
+            for img in images {
                 renditions.push(Rendition {
-                    name,
+                    name: pre_rendered_name(icon_name, IOS_ICON_SIZE, 1, img.appearance_name),
                     identifier: ident,
                     element: car::ELEMENT_UNIVERSAL,
                     part: car::PART_ICON,
-                    scale: *scale as u16,
-                    width: w,
-                    height: h,
-                    pixel_data: pd,
-                    pixel_format: pf,
+                    scale: 1,
+                    width: IOS_ICON_SIZE,
+                    height: IOS_ICON_SIZE,
+                    pixel_data: img.bgra.clone(),
+                    pixel_format: *b"BGRA",
                     layout: car::LAYOUT_ONE_PART_SCALE,
-                    dim2,
-                    variant,
+                    appearance: img.appearance,
+                    idiom,
+                    dim2: car::IOS_ICON_DIM2_SINGLE_SIZE_1024,
                     keyformat: placeholder_kf.clone(),
                     min_deploy: min_deploy.to_string(),
                     platform: platform.to_string(),
-                    colorspace_id: cs_id,
-                    // Apple uses bitmapEncoding=0 (original) for the pre-rendered
-                    // sized PNGs in .icon catalogs; the default (-1 → auto/4)
-                    // sets the rendition_flags bit that makes CUICatalog look
-                    // for a template variant that doesn't exist.
+                    colorspace_id: car::colorspace_for_pixel_format(b"BGRA"),
                     template_rendering_intent: 0,
                     ..Rendition::default()
                 });
             }
-        }
-    }
-
-    // Pack 16/32/64 into ZZZZPackedAsset atlases — one atlas per variant
-    // when the variant axis is active. Each atlas's gamut field controls
-    // its name suffix and routes through to the rendition's attribute 24.
-    for (variant_idx, packed_imgs) in packed_imgs_per_variant.into_iter().enumerate() {
-        if packed_imgs.is_empty() {
-            continue;
-        }
-        let pf = packed_imgs[0].pixel_format;
-        let variant = variant_idx as u16;
-        let mut atlases = crate::packer::pack_images_split(packed_imgs, 262, 196);
-        for atlas in &mut atlases {
-            atlas.gamut = variant_idx as u32;
-            atlas.render();
-            let atlas_name = atlas.name();
-            // Apple uses LZFSE (not deepmap2) for icon atlases regardless of
-            // pixel format — BGRA, GA8 (variant 0), and GA16 (variant 1) all
-            // go through LZFSE.
-            let force_lzfse = matches!(&pf, b"BGRA" | b" 8AG" | b"61AG");
-            let atlas_csi = car::build_packed_asset_csi(
-                &atlas_name,
-                atlas.width,
-                atlas.height,
-                2,
-                &pf,
-                &atlas.pixel_data,
-                min_deploy,
-                platform,
-                force_lzfse,
+            let mut ms_rend = car::build_multisize_rendition(
+                icon_name,
+                ident,
+                &[MultisizeImageEntry {
+                    width: IOS_ICON_SIZE,
+                    height: IOS_ICON_SIZE,
+                    index: car::IOS_ICON_DIM2_SINGLE_SIZE_1024 as u32,
+                }],
             );
-            renditions.push(Rendition {
-                name: atlas_name.clone(),
-                identifier: 0,
-                element: car::ELEMENT_PACKED,
-                part: car::PART_REGULAR,
-                scale: 2,
-                width: atlas.width,
-                height: atlas.height,
-                pixel_data: Vec::new(),
-                pixel_format: pf,
-                layout: car::LAYOUT_NAME_LIST,
-                variant,
-                keyformat: placeholder_kf.clone(),
-                min_deploy: min_deploy.to_string(),
-                platform: platform.to_string(),
-                colorspace_id: car::colorspace_for_pixel_format(&pf),
-                csi_override: Some(atlas_csi),
-                ..Rendition::default()
-            });
+            ms_rend.idiom = idiom;
+            ms_rend.keyformat = placeholder_kf.clone();
+            renditions.push(ms_rend);
+        }
+    } else {
+        // Split images into atlas candidates (small sizes) and inline (large).
+        // For each size load BGRA pixels, then dispatch by point size. When
+        // `emit_variant_axis` is set, every sized rendition is duplicated for
+        // the alternate variant (same pixels — the variant axis is structural;
+        // CUICatalog reads it to pick which alternate to display per-appearance).
+        for (idx, (img_path, pixel_size, scale)) in icon_images.iter().enumerate() {
+            let point_size = pixel_size / scale;
+            let dim2 = icon_dim2(point_size);
+            for &variant in variants {
+                // Use the pre-rendered multi-layer stack for this size and variant
+                // (the alternate variant has its own dark-appearance stack); fall
+                // back to the primary layer if absent.
+                let stacks = if variant == 1 && !dark_stacks.is_empty() {
+                    dark_stacks
+                } else {
+                    light_stacks
+                };
+                let (layer_bgra, w, h) = match stacks.get(idx) {
+                    Some(stack) if stack.len() == (pixel_size * pixel_size * 4) as usize => {
+                        (stack.clone(), *pixel_size, *pixel_size)
+                    }
+                    _ => {
+                        let (b, w, h, _pf) = load_image_as_bgra(img_path, true)?;
+                        (b, w, h)
+                    }
+                };
+                // Composite the layer over the variant's background gradient,
+                // clipped to the squircle. The alternate variant uses the dark
+                // gradient when present.
+                let fill = if variant == 1 {
+                    dark_fill.or(light_fill)
+                } else {
+                    light_fill
+                };
+                let shadow = shadow_params(
+                    if variant == 1 { dark_shadow } else { light_shadow },
+                    *pixel_size,
+                );
+                let composited = match fill {
+                    Some(f) => crate::icon_render::composite_icon(
+                        *pixel_size,
+                        f,
+                        &layer_bgra,
+                        shadow.as_ref(),
+                    )
+                    .unwrap_or_else(|| layer_bgra.clone()),
+                    None => layer_bgra.clone(),
+                };
+                // With the variant axis the composite is stored as a grayscale
+                // image (variant 0 → GA8 cspace 2, variant 1 → GA16 cspace 6);
+                // otherwise it stays BGRA.
+                let (pd, pf, cs_id): (Vec<u8>, [u8; 4], u32) = if emit_variant_axis {
+                    if variant == 0 {
+                        (crate::catalog::bgra_to_ga8_force(&composited), *b" 8AG", 2)
+                    } else {
+                        // The dark (alternate) variant is NOT a baked dark composite
+                        // — Apple stores a flat near-white squircle tint that
+                        // CUICatalog composites over the light icon. Build that tint
+                        // (premult gray 59 / α 60 over the squircle, plus the icon's
+                        // black drop shadow) instead of the dark composite.
+                        let dark = fill
+                            .and_then(|f| {
+                                build_dark_variant_tint(*pixel_size, f, shadow.as_ref())
+                            })
+                            .unwrap_or_else(|| composited.clone());
+                        (crate::catalog::bgra_to_ga16_force(&dark), *b"61AG", 6)
+                    }
+                } else {
+                    (composited, *b"BGRA", car::colorspace_for_pixel_format(b"BGRA"))
+                };
+                let name = pre_rendered_name(
+                    icon_name,
+                    point_size,
+                    *scale,
+                    "NSAppearanceNameSystem",
+                );
+                if ATLAS_POINT_SIZES.contains(&point_size) {
+                    let mut pi = crate::packer::PackedImage::new(
+                        name.clone(),
+                        ident as u32,
+                        w,
+                        h,
+                    );
+                    pi.pixel_data = pd;
+                    pi.pixel_format = pf;
+                    pi.scale = *scale;
+                    pi.part = car::PART_ICON as u32;
+                    pi.dim2 = dim2 as u32;
+                    pi.variant = variant as u32;
+                    packed_imgs_per_variant[variant as usize].push(pi);
+                } else {
+                    renditions.push(Rendition {
+                        name,
+                        identifier: ident,
+                        element: car::ELEMENT_UNIVERSAL,
+                        part: car::PART_ICON,
+                        scale: *scale as u16,
+                        width: w,
+                        height: h,
+                        pixel_data: pd,
+                        pixel_format: pf,
+                        layout: car::LAYOUT_ONE_PART_SCALE,
+                        dim2,
+                        variant,
+                        keyformat: placeholder_kf.clone(),
+                        min_deploy: min_deploy.to_string(),
+                        platform: platform.to_string(),
+                        colorspace_id: cs_id,
+                        // Apple uses bitmapEncoding=0 (original) for the pre-rendered
+                        // sized PNGs in .icon catalogs; the default (-1 → auto/4)
+                        // sets the rendition_flags bit that makes CUICatalog look
+                        // for a template variant that doesn't exist.
+                        template_rendering_intent: 0,
+                        ..Rendition::default()
+                    });
+                }
+            }
+        }
 
-            for img in &atlas.images {
-                let inlk_y = atlas.height - img.y - img.height;
-                let ref_csi = car::build_packed_image_csi(
-                    &img.name,
-                    img.width,
-                    img.height,
-                    img.scale as u16,
+        // Pack 16/32/64 into ZZZZPackedAsset atlases — one atlas per variant
+        // when the variant axis is active. Each atlas's gamut field controls
+        // its name suffix and routes through to the rendition's attribute 24.
+        for (variant_idx, packed_imgs) in packed_imgs_per_variant.into_iter().enumerate() {
+            if packed_imgs.is_empty() {
+                continue;
+            }
+            let pf = packed_imgs[0].pixel_format;
+            let variant = variant_idx as u16;
+            let mut atlases = crate::packer::pack_images_split(packed_imgs, 262, 196);
+            for atlas in &mut atlases {
+                atlas.gamut = variant_idx as u32;
+                atlas.render();
+                let atlas_name = atlas.name();
+                // Apple uses LZFSE (not deepmap2) for icon atlases regardless of
+                // pixel format — BGRA, GA8 (variant 0), and GA16 (variant 1) all
+                // go through LZFSE.
+                let force_lzfse = matches!(&pf, b"BGRA" | b" 8AG" | b"61AG");
+                let atlas_csi = car::build_packed_asset_csi(
+                    &atlas_name,
+                    atlas.width,
+                    atlas.height,
+                    2,
                     &pf,
-                    img.x,
-                    inlk_y,
-                    0,
-                    0,
-                    0,
-                    0,
+                    &atlas.pixel_data,
+                    min_deploy,
+                    platform,
+                    force_lzfse,
                 );
                 renditions.push(Rendition {
-                    name: img.name.clone(),
-                    identifier: ident,
-                    element: car::ELEMENT_UNIVERSAL,
-                    part: car::PART_ICON,
-                    scale: img.scale as u16,
-                    dim2: img.dim2 as u16,
-                    width: img.width,
-                    height: img.height,
+                    name: atlas_name.clone(),
+                    identifier: 0,
+                    element: car::ELEMENT_PACKED,
+                    part: car::PART_REGULAR,
+                    scale: 2,
+                    width: atlas.width,
+                    height: atlas.height,
                     pixel_data: Vec::new(),
                     pixel_format: pf,
-                    layout: car::LAYOUT_PACKED_IMAGE,
+                    layout: car::LAYOUT_NAME_LIST,
                     variant,
                     keyformat: placeholder_kf.clone(),
                     min_deploy: min_deploy.to_string(),
                     platform: platform.to_string(),
                     colorspace_id: car::colorspace_for_pixel_format(&pf),
-                    csi_override: Some(ref_csi),
+                    csi_override: Some(atlas_csi),
                     ..Rendition::default()
+                });
+
+                for img in &atlas.images {
+                    let inlk_y = atlas.height - img.y - img.height;
+                    let ref_csi = car::build_packed_image_csi(
+                        &img.name,
+                        img.width,
+                        img.height,
+                        img.scale as u16,
+                        &pf,
+                        img.x,
+                        inlk_y,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                    renditions.push(Rendition {
+                        name: img.name.clone(),
+                        identifier: ident,
+                        element: car::ELEMENT_UNIVERSAL,
+                        part: car::PART_ICON,
+                        scale: img.scale as u16,
+                        dim2: img.dim2 as u16,
+                        width: img.width,
+                        height: img.height,
+                        pixel_data: Vec::new(),
+                        pixel_format: pf,
+                        layout: car::LAYOUT_PACKED_IMAGE,
+                        variant,
+                        keyformat: placeholder_kf.clone(),
+                        min_deploy: min_deploy.to_string(),
+                        platform: platform.to_string(),
+                        colorspace_id: car::colorspace_for_pixel_format(&pf),
+                        csi_override: Some(ref_csi),
+                        ..Rendition::default()
+                    });
+                }
+            }
+        }
+
+        let mut ms_entries: Vec<MultisizeImageEntry> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (_, pixel_size, scale) in icon_images {
+            let pt = pixel_size / scale;
+            if seen.insert(pt) {
+                ms_entries.push(MultisizeImageEntry {
+                    width: pt,
+                    height: pt,
+                    index: icon_dim2(pt) as u32,
                 });
             }
         }
+        let mut ms_rend = car::build_multisize_rendition(icon_name, ident, &ms_entries);
+        ms_rend.keyformat = placeholder_kf.clone();
+        renditions.push(ms_rend);
     }
-
-    let mut ms_entries: Vec<MultisizeImageEntry> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (_, pixel_size, scale) in icon_images {
-        let pt = pixel_size / scale;
-        if seen.insert(pt) {
-            ms_entries.push(MultisizeImageEntry {
-                width: pt,
-                height: pt,
-                index: icon_dim2(pt) as u32,
-            });
-        }
-    }
-    let mut ms_rend = car::build_multisize_rendition(icon_name, ident, &ms_entries);
-    ms_rend.keyformat = placeholder_kf.clone();
-    renditions.push(ms_rend);
 
     // Apple's FACETKEYS entry for the main icon facet carries part = PART_ICON
-    // (220), the part of its pre-rendered sized renditions — not the
-    // PART_ICON_COMPOSER (245) of the iconstack rendition.
+    // (220), the part of its pre-rendered sized renditions. Apple itself flips
+    // between 220 and PART_ICON_COMPOSER (245, the iconstack's part) from run
+    // to run on identical input, so there is nothing to match.
     let mut facets: Vec<FacetEntry> = vec![(
         icon_name.to_string(),
         car::ELEMENT_UNIVERSAL,
@@ -1536,30 +1755,64 @@ fn build_icon_car(
         // FACETKEYS entry but no rendition — absent from BITMAPKEYS, it made
         // CUICatalog return "no images" (Rectangle's Overlay facet). Build the
         // per-group ident + layer refs so every group resolves.
-        let group_infos: Vec<(u16, Vec<car::LayerRef>)> = group_facet_names
+        use crate::icon_effects::Appearance;
+        let group_infos: Vec<GroupInfo> = group_facet_names
             .iter()
             .zip(groups.iter())
             .map(|(facet, g)| {
-                let ident = hash_name(facet);
-                let layer_refs: Vec<car::LayerRef> = g
-                    .layers
-                    .iter()
-                    .filter(|l| l.hidden != Some(true))
-                    .filter_map(|l| {
-                        let img = l.image_name.as_deref()?;
-                        let stem = std::path::Path::new(img)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or(img);
-                        Some(car::LayerRef {
-                            part: car::PART_REGULAR,
-                            identifier: hash_name(&format!("{icon_name}_Assets/{stem}")),
+                let for_appearance = |appearance: Appearance| {
+                    let eff = crate::icon_effects::resolve_icon_effects(g, appearance);
+                    // Apple lists a group's layers back-to-front, the reverse of
+                    // icon.json, each with its opacity resolved for the appearance.
+                    let refs: Vec<car::LayerRef> = g
+                        .layers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| l.hidden != Some(true))
+                        .filter_map(|(i, l)| {
+                            let img = l.image_name.as_deref()?;
+                            let stem = std::path::Path::new(img)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or(img);
+                            let facet = format!("{icon_name}_Assets/{stem}");
+                            Some(car::LayerRef {
+                                part: car::PART_REGULAR,
+                                identifier: hash_name(&facet),
+                                group_style: None,
+                                glass: !(l.glass == Some(false)
+                                    && l.glass_specializations.is_none()),
+                                frame: layer_assets
+                                    .iter()
+                                    .find(|a| a.facet_name == facet)
+                                    .map(|a| layer_canvas_frame(g, l, &a.source_path)),
+                                opacity: eff.layers.get(i).map(|e| e.opacity).unwrap_or(1.0),
+                            })
                         })
-                    })
-                    .collect();
-                (ident, layer_refs)
+                        .rev()
+                        .collect();
+                    let style = car::GroupStyle {
+                        translucency_enabled: eff.translucency.enabled,
+                        translucency: eff.translucency.value,
+                        shadow_kind: match eff.shadow.kind {
+                            crate::icon_effects::ShadowKind::Neutral => 3,
+                            _ => 0,
+                        },
+                        shadow_opacity: eff.shadow.opacity,
+                    };
+                    (refs, style)
+                };
+                let (light_refs, light_style) = for_appearance(Appearance::Light);
+                let (dark_refs, dark_style) = for_appearance(Appearance::Dark);
+                GroupInfo {
+                    ident: hash_name(facet),
+                    light_refs,
+                    dark_refs,
+                    light_style,
+                    dark_style,
+                }
             })
-            .filter(|(_, refs)| !refs.is_empty())
+            .filter(|g| !g.light_refs.is_empty())
             .collect();
         // Map appearance ID -> gradient facet name. 1=DarkAqua uses the
         // second (dark) gradient; 8=Aqua and 10=Tintable use the first.
@@ -1570,7 +1823,8 @@ fn build_icon_car(
                 .map(|g| g.facet_name.clone())
                 .unwrap_or_else(|| gradient_assets[0].facet_name.clone()),
         );
-        for appearance in [1u16, 8, 10] {
+        let appearances: [u16; 3] = if ios_images.is_some() { [1, 4, 10] } else { [1, 8, 10] };
+        for appearance in appearances {
             let grad_id = if appearance == 1 { grad2_ident } else { grad1_ident };
             // Stack the gradient at the bottom, then the groups back-to-front.
             // icon.json lists groups front-to-back (index 0 topmost), so the
@@ -1578,11 +1832,19 @@ fn build_icon_car(
             let mut stack_layers = vec![car::LayerRef {
                 part: car::PART_ICON_GRADIENT,
                 identifier: grad_id,
+                group_style: None,
+                glass: false,
+                frame: None,
+                opacity: 1.0,
             }];
-            for (ident, _) in group_infos.iter().rev() {
+            for info in group_infos.iter().rev() {
                 stack_layers.push(car::LayerRef {
                     part: car::PART_ICON_GROUP,
-                    identifier: *ident,
+                    identifier: info.ident,
+                    group_style: Some(if appearance == 1 { info.dark_style } else { info.light_style }),
+                    glass: false,
+                    frame: None,
+                    opacity: 1.0,
                 });
             }
             let stack_csi = car::build_iconstack_csi(&stack_name, 1024, &stack_layers);
@@ -1606,7 +1868,9 @@ fn build_icon_car(
                 ..Rendition::default()
             });
 
-            for (group_ident, layer_refs) in &group_infos {
+            for info in &group_infos {
+                let layer_refs = if appearance == 1 { &info.dark_refs } else { &info.light_refs };
+                let group_ident = &info.ident;
                 let group_csi = car::build_icongroup_csi("IconGroup", 1024, layer_refs);
                 renditions.push(Rendition {
                     name: "IconGroup".to_string(),
@@ -1631,7 +1895,11 @@ fn build_icon_car(
         }
     }
 
-    let keyformat = car::compute_keyformat(&renditions, false);
+    let keyformat = if ios_images.is_some() {
+        car::compute_keyformat_ios(&renditions, false)
+    } else {
+        car::compute_keyformat(&renditions, false)
+    };
     for rend in &mut renditions {
         rend.keyformat = keyformat.clone();
     }
@@ -1644,7 +1912,16 @@ fn build_icon_car(
     }
     all_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-    write_icon_car(car_path, &facets, &keyformat, &all_entries, platform, min_deploy)
+    write_icon_car(
+        car_path,
+        &facets,
+        &keyformat,
+        &all_entries,
+        platform,
+        min_deploy,
+        coreui_version,
+        ios_images.is_some(),
+    )
 }
 
 /// A layer's source image, emitted as a `<stem>_Assets/<layer_name>` facet
@@ -1714,6 +1991,153 @@ fn shadow_params(
     })
 }
 
+/// Apple's `.icns` holds the same squircle-clipped, shadowed composite as the
+/// light CAR renditions, not the raw primary layer. Falls back to the source
+/// image for any size whose stack or compositor is unavailable.
+fn composite_icns_sources(
+    icon_images: &[(PathBuf, u32, u32)],
+    light_stacks: &[Vec<u8>],
+    light_fill: Option<&crate::icon_render::GradientFill>,
+    tmpdir: &Path,
+) -> Result<Vec<(PathBuf, u32, u32)>> {
+    use crate::icon_effects::{ShadowKind, ShadowSpec};
+    let spec = Some(ShadowSpec { kind: ShadowKind::Neutral, opacity: 0.5 });
+    let mut out = Vec::with_capacity(icon_images.len());
+    for (idx, (path, px, scale)) in icon_images.iter().enumerate() {
+        let composited = match (light_fill, light_stacks.get(idx)) {
+            (Some(fill), Some(stack)) => crate::icon_render::composite_icon(
+                *px,
+                fill,
+                stack,
+                shadow_params(spec, *px).as_ref(),
+            ),
+            _ => None,
+        };
+        let Some(bgra) = composited else {
+            out.push((path.clone(), *px, *scale));
+            continue;
+        };
+        let mut rgba = Vec::with_capacity(bgra.len());
+        for p in bgra.chunks_exact(4) {
+            let a = p[3] as u32;
+            let un = |c: u8| -> u8 {
+                if a == 0 { 0 } else { ((c as u32 * 255 + a / 2) / a).min(255) as u8 }
+            };
+            rgba.extend_from_slice(&[un(p[2]), un(p[1]), un(p[0]), p[3]]);
+        }
+        let img = image::RgbaImage::from_raw(*px, *px, rgba)
+            .ok_or_else(|| anyhow::anyhow!("icns composite size mismatch"))?;
+        let file = tmpdir.join(format!("Icns{px}x{px}.png"));
+        img.save(&file)?;
+        out.push((file, *px, *scale));
+    }
+    Ok(out)
+}
+
+/// One pre-rendered iOS 1024pt app-icon variant.
+struct IosComposite {
+    /// CoreUI appearance name used in the rendition name.
+    appearance_name: &'static str,
+    /// Appearance attribute (UIAppearanceAny=0, Dark=1, Tintable=10).
+    appearance: u16,
+    /// Opaque premultiplied BGRA, 1024².
+    bgra: Vec<u8>,
+}
+
+const IOS_ICON_SIZE: u32 = 1024;
+
+/// Composite a premultiplied layer stack over a full-bleed gradient (no
+/// squircle, margin or shadow — iOS masks the icon at runtime). The result is
+/// fully opaque.
+fn composite_fullbleed(
+    stack: &[u8],
+    pixel_size: u32,
+    fill: Option<&crate::icon_render::GradientFill>,
+) -> Vec<u8> {
+    let w = pixel_size as usize;
+    let mut out = vec![0u8; w * w * 4];
+    for y in 0..w {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            let bg = match fill {
+                Some(f) => f.sample_with_margin(x as u32, y as u32, pixel_size, 0.0),
+                None => [1.0, 1.0, 1.0],
+            };
+            let a = stack[i + 3] as f32 / 255.0;
+            // BGRA, premultiplied: dst = src + bg·(1 − a).
+            for c in 0..3 {
+                let layer = stack[i + c] as f32;
+                let back = bg[2 - c] as f32 * 255.0;
+                out[i + c] = (layer + back * (1.0 - a)).round().clamp(0.0, 255.0) as u8;
+            }
+            out[i + 3] = 255;
+        }
+    }
+    out
+}
+
+/// Render the Any / Dark / Tintable variants Apple stores for an iOS icon.
+/// Tintable is the dark stack's luminance over black (the system re-tints it).
+fn render_ios_composites(
+    light_layers: &[StackLayer],
+    dark_layers: &[StackLayer],
+    light_fill: Option<&crate::icon_render::GradientFill>,
+    dark_fill: Option<&crate::icon_render::GradientFill>,
+) -> Result<Vec<IosComposite>> {
+    let size = IOS_ICON_SIZE;
+    let any_stack = render_layer_stack(light_layers, size, light_fill)?;
+    let dark_stack = render_layer_stack(dark_layers, size, dark_fill)?;
+    let any = composite_fullbleed(&any_stack, size, light_fill);
+    let dark = composite_fullbleed(&dark_stack, size, dark_fill);
+    let black = crate::icon_render::GradientFill {
+        start_rgb: [0.0; 3],
+        stop_rgb: [0.0; 3],
+        start: [0.5, 0.0],
+        stop: [0.5, 1.0],
+    };
+    let mut tint = composite_fullbleed(&dark_stack, size, Some(&black));
+    for px in tint.chunks_exact_mut(4) {
+        let luma = 0.114 * px[0] as f32 + 0.587 * px[1] as f32 + 0.299 * px[2] as f32;
+        let g = luma.round().clamp(0.0, 255.0) as u8;
+        px[..3].fill(g);
+    }
+    Ok(vec![
+        IosComposite { appearance_name: "UIAppearanceAny", appearance: 0, bgra: any },
+        IosComposite { appearance_name: "UIAppearanceDark", appearance: 1, bgra: dark },
+        IosComposite { appearance_name: "ISAppearanceTintable", appearance: 10, bgra: tint },
+    ])
+}
+
+/// Loose home-screen PNGs actool writes next to Assets.car for iOS:
+/// `<name>60x60@2x.png` (iPhone) and `<name>76x76@2x~ipad.png` (iPad), cut
+/// down from the Any composite.
+fn write_ios_home_screen_icons(
+    icon_name: &str,
+    images: &[IosComposite],
+    output_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    let Some(any) = images.iter().find(|i| i.appearance == 0) else {
+        return Ok(Vec::new());
+    };
+    let rgba: Vec<u8> = any
+        .bgra
+        .chunks_exact(4)
+        .flat_map(|p| [p[2], p[1], p[0], p[3]])
+        .collect();
+    let full = image::RgbaImage::from_raw(IOS_ICON_SIZE, IOS_ICON_SIZE, rgba)
+        .ok_or_else(|| anyhow::anyhow!("ios icon size mismatch"))?;
+    let mut out = Vec::new();
+    for (file, px) in [
+        (format!("{icon_name}60x60@2x.png"), 120),
+        (format!("{icon_name}76x76@2x~ipad.png"), 152),
+    ] {
+        let path = output_dir.join(file);
+        image::imageops::resize(&full, px, px, FilterType::Lanczos3).save(&path)?;
+        out.push(fs::canonicalize(&path).unwrap_or(path));
+    }
+    Ok(out)
+}
+
 /// Premultiplied-gray and alpha of Apple's flat dark-variant tint at full
 /// squircle coverage (measured constant on feishin/scrumdinger GA16: a
 /// near-white tint, premult gray ≈59, α ≈60 — `tools/compare_variant_renditions.py`).
@@ -1761,6 +2185,7 @@ fn build_dark_variant_tint(
 fn resolve_gradient_fill(
     grad: &GradientAsset,
     colors: &[ColorAsset],
+    base_scale: f32,
 ) -> Option<crate::icon_render::GradientFill> {
     let rgb = |facet: &str| -> Option<[f64; 3]> {
         colors.iter().find(|c| c.facet_name == facet).map(color_to_rgb)
@@ -1786,7 +2211,7 @@ fn resolve_gradient_fill(
     // centre, so the full-box top→bottom gradient spans canvas y ≈ [181,843],
     // not the full squircle [100,924]. Measured on a black→white probe (gradient
     // span 662 px = 824·LAYER_BASE_SCALE, centred); applies to x too.
-    let inset = |p: f32| 0.5 + (p - 0.5) * LAYER_BASE_SCALE;
+    let inset = |p: f32| 0.5 + (p - 0.5) * base_scale;
     Some(crate::icon_render::GradientFill {
         start_rgb,
         stop_rgb,
@@ -1823,13 +2248,14 @@ fn resolve_background_fills(
     parsed: &IconJson,
     gradient_assets: &[GradientAsset],
     color_assets: &[ColorAsset],
+    base_scale: f32,
 ) -> (Option<crate::icon_render::GradientFill>, Option<crate::icon_render::GradientFill>) {
     if let Some(rgb) = solid_fill_color(parsed) {
-        let dark = gradient_assets.first().and_then(|g| resolve_gradient_fill(g, color_assets));
+        let dark = gradient_assets.first().and_then(|g| resolve_gradient_fill(g, color_assets, base_scale));
         return (Some(flat_fill(rgb)), dark);
     }
-    let light = gradient_assets.first().and_then(|g| resolve_gradient_fill(g, color_assets));
-    let dark = gradient_assets.get(1).and_then(|g| resolve_gradient_fill(g, color_assets));
+    let light = gradient_assets.first().and_then(|g| resolve_gradient_fill(g, color_assets, base_scale));
+    let dark = gradient_assets.get(1).and_then(|g| resolve_gradient_fill(g, color_assets, base_scale));
     (light, dark)
 }
 
@@ -1905,14 +2331,20 @@ fn fill_is_automatic(fill: Option<&Fill>) -> bool {
 /// axis: a bundle with dark content gets a second (dark) set of renditions
 /// keyed on attr 24 = 1. Walks the raw JSON so it catches every specialization
 /// array without enumerating each typed field. `tinted` entries are ignored —
-/// tint mode is a live system recolour, never a stored variant.
+/// tint mode is a live system recolour, never a stored variant. Visibility
+/// swaps (`opacity-`/`hidden-specializations`, e.g. Chimera's dark-only layer)
+/// are ignored too: Apple composes those live and emits no variant axis.
 fn json_has_dark_appearance(v: &serde_json::Value) -> bool {
     match v {
         serde_json::Value::Object(map) => {
             if map.get("appearance").and_then(|a| a.as_str()) == Some("dark") {
                 return true;
             }
-            map.values().any(json_has_dark_appearance)
+            map.iter().any(|(k, child)| {
+                k != "opacity-specializations"
+                    && k != "hidden-specializations"
+                    && json_has_dark_appearance(child)
+            })
         }
         serde_json::Value::Array(items) => items.iter().any(json_has_dark_appearance),
         _ => false,
@@ -2010,50 +2442,72 @@ fn linear_gradient_fill_assets(
     }
     let (cs0, c0) = parse_color_spec(stops_spec[0])?;
     let (cs1, c1) = parse_color_spec(stops_spec[1])?;
-    let n = |s: &str| format!("{facet_prefix}_Assets/{s}");
     let g = |v: f32| (v as f32) as f64;
-    let colors = vec![
-        ColorAsset {
-            facet_name: n("Color-1"),
-            colorspace_id: 6,
-            components: vec![g(1.0), g(1.0)],
-        },
-        ColorAsset {
-            facet_name: n("Color-2"),
-            colorspace_id: cs0,
-            components: c0,
-        },
-        ColorAsset {
-            facet_name: n("Color-3"),
-            colorspace_id: cs1,
-            components: c1,
-        },
-        ColorAsset {
-            facet_name: n("Color-4"),
-            colorspace_id: 2,
-            components: vec![g(0.192), g(1.0)],
-        },
-        ColorAsset {
-            facet_name: n("Color-5"),
-            colorspace_id: 2,
-            components: vec![g(0.078), g(1.0)],
-        },
-    ];
+    let mut colors = vec![ColorAsset {
+        facet_name: format!("{facet_prefix}_Assets/Color-1"),
+        colorspace_id: 6,
+        components: vec![g(1.0), g(1.0)],
+    }];
+    // Apple deduplicates by value: a white first stop is the Color-1 anchor
+    // itself (srb2: 4 Colors), and the dark-background grays follow the stops.
+    let n0 = palette_add_color(&mut colors, facet_prefix, cs0, c0, 0);
+    let n1 = palette_add_color(&mut colors, facet_prefix, cs1, c1, 0);
+    let d0 = palette_add_color(&mut colors, facet_prefix, 2, vec![g(0.192), g(1.0)], 0);
+    let d1 = palette_add_color(&mut colors, facet_prefix, 2, vec![g(0.078), g(1.0)], 0);
     let gradients = vec![
         GradientAsset {
-            facet_name: n("Gradient-1"),
+            facet_name: format!("{facet_prefix}_Assets/Gradient-1"),
             geometry: [0.5, 0.0, 0.5, 1.0],
-            stops: vec![(0.0, n("Color-2")), (1.0, n("Color-3"))],
+            stops: vec![(0.0, n0), (1.0, n1)],
             kind: 1,
         },
         GradientAsset {
-            facet_name: n("Gradient-2"),
+            facet_name: format!("{facet_prefix}_Assets/Gradient-2"),
             geometry: [0.5, 0.0, 0.5, 1.0],
-            stops: vec![(0.0, n("Color-4")), (1.0, n("Color-5"))],
+            stops: vec![(0.0, d0), (1.0, d1)],
             kind: 1,
         },
     ];
     Some((colors, gradients))
+}
+
+/// Rename the stock background gradients the way CoreUI 1000+ does: the gray
+/// pairs Apple uses for the light/dark system backgrounds become
+/// `system-light`/`system-dark`; everything else keeps a `Gradient-N` name,
+/// renumbered in order. A duplicate stock pair keeps its numbered name.
+fn name_system_gradients(
+    facet_prefix: &str,
+    colors: &[ColorAsset],
+    gradients: &mut [GradientAsset],
+) {
+    let gray = |name: &str| -> Option<f64> {
+        let c = colors.iter().find(|c| c.facet_name == name)?;
+        (c.colorspace_id == 2).then(|| c.components[0])
+    };
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-3;
+    let mut used: Vec<&'static str> = Vec::new();
+    let mut numbered = 0;
+    for grad in gradients.iter_mut() {
+        let stock = if grad.kind == 1 && grad.stops.len() == 2 {
+            match (gray(&grad.stops[0].1), gray(&grad.stops[1].1)) {
+                (Some(t), Some(b)) if near(t, 1.0) && near(b, 0.925) => Some("system-light"),
+                (Some(t), Some(b)) if near(t, 0.192) && near(b, 0.078) => Some("system-dark"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match stock {
+            Some(name) if !used.contains(&name) => {
+                used.push(name);
+                grad.facet_name = format!("{facet_prefix}_Assets/{name}");
+            }
+            _ => {
+                numbered += 1;
+                grad.facet_name = format!("{facet_prefix}_Assets/Gradient-{numbered}");
+            }
+        }
+    }
 }
 
 /// Apple's palette for `fill: {"automatic-gradient": "<color spec>"}` —
@@ -2432,14 +2886,20 @@ fn write_icon_car(
     all_entries: &[(Vec<u8>, Vec<u8>)],
     platform: &str,
     min_deploy: &str,
+    coreui_version: u32,
+    ios: bool,
 ) -> Result<()> {
     let mut bom = BomWriter::new();
-    // Declare CoreUI 975 so the IconComposer code paths in CoreUI activate
-    // — older values cause silent `imagesWithName:` empty results even when
+    // CoreUI must be 975 or newer so the IconComposer code paths activate —
+    // older values cause silent `imagesWithName:` empty results even when
     // FACETKEYS / RENDITIONS are byte-identical to Apple's output.
     bom.add_named_block(
         "CARHEADER",
-        car::make_carheader_versioned(all_entries.len() as u32, 975),
+        if ios {
+            car::make_carheader_full(all_entries.len() as u32, coreui_version, 2)
+        } else {
+            car::make_carheader_versioned(all_entries.len() as u32, coreui_version)
+        },
     );
     // The named-block ORDER below matches Apple's actool exactly. CUICatalog
     // appears to scan named blocks during initWithURL: in BOM order and
@@ -2458,9 +2918,14 @@ fn write_icon_car(
         })
         .collect();
     facetkey_entries.sort_by(|a, b| a.0.cmp(&b.0));
+    bom.set_compact_variable_trees(coreui_version >= SYSTEM_GRADIENT_NAMES_MIN_COREUI);
     bom.add_tree("FACETKEYS", &facetkey_entries, 4096);
 
-    let mut appearance_entries = car::make_appearancekeys_entries();
+    let mut appearance_entries = if ios {
+        car::make_ios_appearancekeys_entries()
+    } else {
+        car::make_appearancekeys_entries()
+    };
     appearance_entries.sort_by(|a, b| a.0.cmp(&b.0));
     bom.add_tree("APPEARANCEKEYS", &appearance_entries, 4096);
 
@@ -2830,6 +3295,87 @@ mod tests {
         assert_eq!(gradients.len(), 2, "redundant layer automatic must dedup");
         let cs: Vec<u32> = colors.iter().map(|c| c.colorspace_id).collect();
         assert_eq!(cs, vec![6, 2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn visibility_specializations_do_not_trigger_the_variant_axis() {
+        // Chimera swaps which layer shows in dark; Apple emits no dark axis.
+        let swap = serde_json::json!({
+            "groups": [{"layers": [
+                {"opacity-specializations": [{"value": 0}, {"appearance": "dark", "value": 1}]},
+                {"hidden-specializations": [{"appearance": "dark", "value": true}]}
+            ]}]
+        });
+        assert!(!json_has_dark_appearance(&swap));
+        let fill = serde_json::json!({
+            "groups": [{"layers": [{"fill-specializations": [{"appearance": "dark", "value": "automatic"}]}]}]
+        });
+        assert!(json_has_dark_appearance(&fill));
+    }
+
+    #[test]
+    fn layer_canvas_frame_matches_apple_for_a_scaled_layer() {
+        let dir = std::env::temp_dir().join(format!("frame_t_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("head.png");
+        image::RgbaImage::new(746, 734).save(&png).unwrap();
+        let json = r#"{"groups":[{"layers":[{"image-name":"head.png","position":{"scale":1.4,"translation-in-points":[0,0]}}]}]}"#;
+        let parsed = crate::icon_json::IconJson::parse(json).unwrap();
+        let g = &parsed.groups[0];
+        assert_eq!(layer_canvas_frame(g, &g.layers[0], &png), (-11, -2, 1044, 1028));
+    }
+
+    fn named_palette(colors: &[(&str, u32, [f64; 2])], grads: &[(&str, [&str; 2])]) -> (Vec<ColorAsset>, Vec<GradientAsset>) {
+        let c = colors
+            .iter()
+            .map(|(n, cs, v)| ColorAsset { facet_name: format!("P_Assets/{n}"), colorspace_id: *cs, components: v.to_vec() })
+            .collect();
+        let g = grads
+            .iter()
+            .map(|(n, s)| GradientAsset {
+                facet_name: format!("P_Assets/{n}"),
+                geometry: [0.5, 0.0, 0.5, 1.0],
+                stops: vec![(0.0, format!("P_Assets/{}", s[0])), (1.0, format!("P_Assets/{}", s[1]))],
+                kind: 1,
+            })
+            .collect();
+        (c, g)
+    }
+
+    #[test]
+    fn stock_gradients_are_named_and_the_rest_renumbered() {
+        let (colors, mut grads) = named_palette(
+            &[("Color-1", 6, [1.0, 1.0]), ("Color-2", 2, [1.0, 1.0]), ("Color-3", 2, [0.925, 1.0]),
+              ("Color-4", 2, [0.192, 1.0]), ("Color-5", 2, [0.078, 1.0]), ("Color-6", 2, [0.5, 1.0])],
+            &[("Gradient-1", ["Color-2", "Color-3"]), ("Gradient-2", ["Color-4", "Color-5"]),
+              ("Gradient-3", ["Color-3", "Color-6"])],
+        );
+        name_system_gradients("P", &colors, &mut grads);
+        let names: Vec<_> = grads.iter().map(|g| g.facet_name.as_str()).collect();
+        assert_eq!(names, ["P_Assets/system-light", "P_Assets/system-dark", "P_Assets/Gradient-1"]);
+    }
+
+    #[test]
+    fn a_repeated_stock_gradient_keeps_a_numbered_name() {
+        let (colors, mut grads) = named_palette(
+            &[("Color-1", 2, [0.192, 1.0]), ("Color-2", 2, [0.078, 1.0])],
+            &[("Gradient-1", ["Color-1", "Color-2"]), ("Gradient-2", ["Color-1", "Color-2"])],
+        );
+        name_system_gradients("P", &colors, &mut grads);
+        assert_eq!(grads[0].facet_name, "P_Assets/system-dark");
+        assert_eq!(grads[1].facet_name, "P_Assets/Gradient-1");
+    }
+
+    #[test]
+    fn linear_gradient_palette_deduplicates_a_white_first_stop() {
+        let (colors, gradients) =
+            linear_gradient_fill_assets("L", &["extended-gray:1.0,1.0", "display-p3:0.0,0.0,1.0,1.0"]).unwrap();
+        assert_eq!(colors.len(), 4);
+        assert_eq!(gradients[0].stops[0].1, "L_Assets/Color-1");
+        assert_eq!(gradients[0].stops[1].1, "L_Assets/Color-2");
+        let (colors, _) =
+            linear_gradient_fill_assets("L", &["display-p3:0.9,1.0,0.9,1.0", "display-p3:0.0,0.0,1.0,1.0"]).unwrap();
+        assert_eq!(colors.len(), 5);
     }
 }
 
