@@ -40,19 +40,27 @@ where
 }
 
 /// True for the device-family platforms whose catalogs encode idiom in the
-/// rendition key (iOS and its simulator). macOS keeps the legacy layout.
+/// rendition key (iOS/tvOS and their simulators). macOS keeps the legacy layout.
 pub fn is_idiom_platform(platform: &str) -> bool {
-    matches!(platform, "iphoneos" | "iphonesimulator")
+    matches!(platform, "iphoneos" | "iphonesimulator" | "appletvos" | "appletvsimulator")
 }
 
 /// CoreUI deployment-platform string written into EXTENDED_METADATA. actool
-/// records the device family ("ios"), not the SDK name ("iphoneos").
+/// records the device family ("ios" / "atv"), not the SDK name
+/// ("iphoneos" / "appletvos").
 pub fn deployment_platform_name(platform: &str) -> &str {
     match platform {
         "iphoneos" | "iphonesimulator" => "ios",
+        "appletvos" | "appletvsimulator" => "atv",
         other => other,
     }
 }
+
+/// Dimension2 index used for the 1024pt source in Xcode 14+ single-size
+/// iOS app icons. The single 1024 source is shared by both phone and pad
+/// facets and uses index 1 rather than the multi-size marketing 1024 slot
+/// (which is 8).
+pub const IOS_ICON_DIM2_SINGLE_SIZE_1024: u16 = 1;
 
 /// Numeric value for an asset-catalog `idiom` string, as encoded in rendition
 /// key attribute 15. Values match CoreUI's `kCoreThemeIdiom*` enum.
@@ -79,6 +87,8 @@ pub const ELEMENT_PACKED: u16 = 9;
 pub const PART_ICON: u16 = 220;
 pub const PART_ICON_MULTISIZE: u16 = 218;
 pub const PART_REGULAR: u16 = 181;
+pub const PART_TVOS_FLATTENED: u16 = 208;
+pub const PART_TVOS_RADIOSITY: u16 = 209;
 pub const PART_COLOR: u16 = 217;
 pub const PART_SPRITE_ATLAS: u16 = 127;
 // IconComposer (.icon) part IDs observed in Apple's actool output.
@@ -332,6 +342,20 @@ pub fn make_appearancekeys_entries() -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
+/// APPEARANCEKEYS for idiom platforms (iOS), as Apple writes them for `.icon`
+/// catalogs: the UIKit appearance names plus the Tintable mode.
+pub fn make_ios_appearancekeys_entries() -> Vec<(Vec<u8>, Vec<u8>)> {
+    [
+        ("UIAppearanceAny", 0u16),
+        ("UIAppearanceDark", 1),
+        ("UIAppearanceLight", 4),
+        ("ISAppearanceTintable", 10),
+    ]
+    .iter()
+    .map(|(name, id)| (name.as_bytes().to_vec(), id.to_le_bytes().to_vec()))
+    .collect()
+}
+
 pub fn make_facetkey_value(element: u16, part: Option<u16>, identifier: u16) -> Vec<u8> {
     let mut attrs: Vec<(u16, u16)> = Vec::new();
     attrs.push((1, element));
@@ -429,7 +453,8 @@ fn lzfse_compress(input: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn compress_kcbc(pixel_data: &[u8], height: u32) -> Option<Vec<u8>> {
+/// Returns the KCBC chunk stream and the number of chunks it holds.
+fn compress_kcbc(pixel_data: &[u8], height: u32) -> Option<(Vec<u8>, u32)> {
     if pixel_data.is_empty() || height == 0 {
         return None;
     }
@@ -444,6 +469,7 @@ fn compress_kcbc(pixel_data: &[u8], height: u32) -> Option<Vec<u8>> {
     };
     let mut out = Vec::new();
     let mut row = 0usize;
+    let mut chunks = 0u32;
     let total = height as usize;
     while row < total {
         let n = rows_per_chunk.min(total - row);
@@ -455,11 +481,12 @@ fn compress_kcbc(pixel_data: &[u8], height: u32) -> Option<Vec<u8>> {
         out.write_u32::<LittleEndian>(compressed.len() as u32).unwrap();
         out.extend_from_slice(&compressed);
         row += n;
+        chunks += 1;
         if row < total {
             out.extend_from_slice(b"KCBC");
         }
     }
-    Some(out)
+    Some((out, chunks))
 }
 
 fn gzip_compress(data: &[u8]) -> Option<Vec<u8>> {
@@ -502,13 +529,13 @@ pub fn compress_data(
 
     let lzfse_min = min_lzfse_version(platform);
     if deploy_ver >= lzfse_min && pixel_data.len() > 256 {
-        if let Some(kcbc) = compress_kcbc(pixel_data, height) {
+        if let Some((kcbc, chunks)) = compress_kcbc(pixel_data, height) {
             let celm_ver: u32 = if is_opaque { 3 } else { 1 };
             let mut out = Vec::new();
             out.extend_from_slice(b"MLEC");
             out.write_u32::<LittleEndian>(celm_ver).unwrap();
             out.write_u32::<LittleEndian>(4).unwrap();
-            out.write_u32::<LittleEndian>(3).unwrap();
+            out.write_u32::<LittleEndian>(chunks).unwrap();
             out.extend_from_slice(b"KCBC");
             out.extend_from_slice(&kcbc);
             return out;
@@ -858,6 +885,37 @@ pub fn build_packed_asset_csi(
 pub struct LayerRef {
     pub part: u16,
     pub identifier: u16,
+    /// Group-level rendering parameters, carried by a group's entry in the
+    /// iconstack. `None` writes the legacy defaults.
+    pub group_style: Option<GroupStyle>,
+    /// Layer-level glass flag, carried by a layer's entry in an IconGroup.
+    pub glass: bool,
+    /// Layer placement `(x, y, w, h)` on the 1024pt canvas, carried by a
+    /// layer's entry in an IconGroup. `None` falls back to the full canvas.
+    pub frame: Option<(i32, i32, u32, u32)>,
+    /// Layer opacity for the rendition's appearance, carried by a layer's
+    /// entry in an IconGroup.
+    pub opacity: f32,
+}
+
+#[derive(Clone, Copy)]
+pub struct GroupStyle {
+    pub translucency_enabled: bool,
+    pub translucency: f32,
+    /// Raw shadow-kind code; only neutral (3) has been observed in Apple's output.
+    pub shadow_kind: u32,
+    pub shadow_opacity: f32,
+}
+
+/// 0x3FE: count + 12 bytes per layer + 4-byte trailer, all zero in every
+/// Apple catalog observed.
+fn write_t3fe(layer_count: usize) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.write_u32::<LittleEndian>(layer_count as u32).unwrap();
+    b.extend(std::iter::repeat(0u8).take(layer_count * 12 + 4));
+    let mut out = tlv_header(0x03FE, b.len() as u32);
+    out.extend(b);
+    out
 }
 
 fn write_layer_key_fragment(buf: &mut Vec<u8>, r: &LayerRef) {
@@ -894,15 +952,25 @@ pub fn build_iconstack_csi(name: &str, dim: u32, layers: &[LayerRef]) -> Vec<u8>
         t3fc.write_u8(0).unwrap();
     }
 
-    // 0x3FD: 4 (count) + N × 20-byte entries + 4-byte trailer.
-    // Each entry is 16 zeros + f32 — Apple writes 0.5 for group-typed
-    // layers (part == PART_ICON_GROUP), 0.0 otherwise.
+    // 0x3FD: 4 (count) + N × 20-byte entries + 4-byte trailer. A group's entry
+    // is [pad, translucency enabled, translucency value, shadow kind, shadow
+    // opacity]; every other entry is zero.
     let mut t3fd = Vec::new();
     t3fd.write_u32::<LittleEndian>(layers.len() as u32).unwrap();
     for layer in layers {
-        t3fd.extend(std::iter::repeat(0u8).take(16));
-        let v = if layer.part == PART_ICON_GROUP { 0.5 } else { 0.0 };
-        t3fd.write_f32::<LittleEndian>(v).unwrap();
+        match (layer.part == PART_ICON_GROUP, layer.group_style) {
+            (true, Some(st)) => {
+                t3fd.write_u32::<LittleEndian>(0).unwrap();
+                t3fd.write_u32::<LittleEndian>(st.translucency_enabled as u32).unwrap();
+                t3fd.write_f32::<LittleEndian>(st.translucency).unwrap();
+                t3fd.write_u32::<LittleEndian>(st.shadow_kind).unwrap();
+                t3fd.write_f32::<LittleEndian>(st.shadow_opacity).unwrap();
+            }
+            (is_group, _) => {
+                t3fd.extend(std::iter::repeat(0u8).take(16));
+                t3fd.write_f32::<LittleEndian>(if is_group { 0.5 } else { 0.0 }).unwrap();
+            }
+        }
     }
     t3fd.extend(std::iter::repeat(0u8).take(4));
 
@@ -913,6 +981,7 @@ pub fn build_iconstack_csi(name: &str, dim: u32, layers: &[LayerRef]) -> Vec<u8>
     tlv.extend(t3fc);
     tlv.extend(tlv_header(0x03FD, t3fd.len() as u32));
     tlv.extend(t3fd);
+    tlv.extend(write_t3fe(layers.len()));
     tlv.extend(make_blend_opacity_tlv());
     tlv.extend(make_layered_uti_tlv());
     tlv.extend(make_exif_orientation_tlv(1));
@@ -942,11 +1011,14 @@ pub fn build_icongroup_csi(name: &str, child_dim: u32, layers: &[LayerRef]) -> V
     let mut t3f4 = Vec::new();
     t3f4.write_u32::<LittleEndian>(layers.len() as u32).unwrap();
     for layer in layers {
-        t3f4.extend(std::iter::repeat(0u8).take(16));
-        t3f4.write_u32::<LittleEndian>(child_dim).unwrap();
-        t3f4.write_u32::<LittleEndian>(child_dim).unwrap();
+        let (x, y, w, h) = layer.frame.unwrap_or((0, 0, child_dim, child_dim));
+        t3f4.write_u64::<LittleEndian>(0).unwrap();
+        t3f4.write_i32::<LittleEndian>(x).unwrap();
+        t3f4.write_i32::<LittleEndian>(y).unwrap();
+        t3f4.write_u32::<LittleEndian>(w).unwrap();
+        t3f4.write_u32::<LittleEndian>(h).unwrap();
         t3f4.write_u32::<LittleEndian>(0).unwrap();
-        t3f4.write_f32::<LittleEndian>(1.0).unwrap();
+        t3f4.write_f32::<LittleEndian>(layer.opacity).unwrap();
         t3f4.write_u32::<LittleEndian>(16).unwrap();
         write_layer_key_fragment(&mut t3f4, layer);
     }
@@ -955,8 +1027,8 @@ pub fn build_icongroup_csi(name: &str, child_dim: u32, layers: &[LayerRef]) -> V
     let mut t3fc = Vec::new();
     t3fc.write_u32::<LittleEndian>(layers.len() as u32).unwrap();
     t3fc.write_u32::<LittleEndian>(0).unwrap();
-    for _ in layers {
-        t3fc.write_u32::<LittleEndian>(0).unwrap();
+    for layer in layers {
+        t3fc.write_u32::<LittleEndian>(layer.glass as u32).unwrap();
         t3fc.write_u32::<LittleEndian>(0).unwrap();
         t3fc.write_u32::<LittleEndian>(1).unwrap();
         t3fc.write_u8(0).unwrap();
@@ -978,6 +1050,7 @@ pub fn build_icongroup_csi(name: &str, child_dim: u32, layers: &[LayerRef]) -> V
     tlv.extend(t3fc);
     tlv.extend(tlv_header(0x03FD, t3fd.len() as u32));
     tlv.extend(t3fd);
+    tlv.extend(write_t3fe(layers.len()));
     tlv.extend(make_blend_opacity_tlv());
     tlv.extend(make_exif_orientation_tlv(1));
 
@@ -1484,8 +1557,18 @@ impl Rendition {
         }
         let scale_factor = self.scale as u32 * 100;
 
+        let is_tvos_icon =
+            self.part == PART_TVOS_FLATTENED || self.part == PART_TVOS_RADIOSITY;
+
         let mut tlv = Vec::new();
-        if self.layout == LAYOUT_ONE_PART_SCALE {
+        if is_tvos_icon {
+            // tvOS brandasset flattened/radiosity images carry the same slice,
+            // blend, orientation and bytes-per-row TLVs as regular scaled
+            // bitmaps, but omit the metrics TLV that Apple does not emit here.
+            tlv.extend(make_slices_tlv(self.width, self.height));
+            tlv.extend(make_blend_opacity_tlv());
+            tlv.extend(make_exif_orientation_tlv(1));
+        } else if self.layout == LAYOUT_ONE_PART_SCALE {
             tlv.extend(make_slices_tlv(self.width, self.height));
             tlv.extend(make_metrics_tlv(self.width, self.height));
             tlv.extend(make_blend_opacity_tlv());
@@ -1504,8 +1587,11 @@ impl Rendition {
             // and Apple deepmap2's the two large grayscale GA8 icons (speed-dark)
             // that we used to force through KCBC. The `.icon` variant axis is the
             // exception: there Apple uses KCBC for *every* GA8/GA16 (feishin: 0
-            // dmp2), so PART_ICON stays off deepmap2.
+            // dmp2), so PART_ICON stays off deepmap2. tvOS brandasset flattened
+            // and radiosity images also stay off deepmap2; the latter uses the
+            // special "blurred" compression (comp=6) instead.
             let use_dmp2 = self.part != PART_ICON
+                && !is_tvos_icon
                 && (&self.pixel_format == b"BGRA" || &self.pixel_format == b" 8AG");
 
             let mut pixel_data = self.pixel_data.clone();
@@ -1810,5 +1896,83 @@ mod tests {
         let csi = r.csi_override.as_ref().unwrap();
         // Rendition data contains "SISM" marker.
         assert!(csi.windows(4).any(|w| w == b"SISM"));
+    }
+
+    #[test]
+    fn kcbc_header_counts_every_chunk() {
+        // 256 rows split into 85-row chunks leaves a 1-row tail: four chunks,
+        // not the three a fixed header would claim.
+        let rows = 256u32;
+        let pixels: Vec<u8> = (0..rows * 256 * 4).map(|i| (i % 251) as u8).collect();
+        let out = compress_data(&pixels, b"BGRA", 256, rows, "11.0", "macosx", false, false, false);
+        assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 4, "KCBC compression");
+        assert_eq!(u32::from_le_bytes(out[12..16].try_into().unwrap()), 4, "chunk count");
+        let kcbc_tags = out.windows(4).filter(|w| *w == b"KCBC").count();
+        assert_eq!(kcbc_tags, 4);
+
+        let divisible = compress_data(&pixels[..255 * 256 * 4], b"BGRA", 256, 255, "11.0", "macosx", false, false, false);
+        assert_eq!(u32::from_le_bytes(divisible[12..16].try_into().unwrap()), 3);
+    }
+
+    fn word(tlv: &[u8], tag: u32) -> Vec<u8> {
+        let mut p = 0;
+        while p + 8 <= tlv.len() {
+            let t = u32::from_le_bytes(tlv[p..p + 4].try_into().unwrap());
+            let l = u32::from_le_bytes(tlv[p + 4..p + 8].try_into().unwrap()) as usize;
+            if t == tag {
+                return tlv[p + 8..p + 8 + l].to_vec();
+            }
+            p += 8 + l;
+        }
+        panic!("tag {tag:#x} missing");
+    }
+
+    fn csi_tlv(csi: &[u8]) -> &[u8] {
+        let tlv_len = u32::from_le_bytes(csi[168..172].try_into().unwrap()) as usize;
+        &csi[184..184 + tlv_len]
+    }
+
+    fn layer(part: u16, id: u16) -> LayerRef {
+        LayerRef { part, identifier: id, group_style: None, glass: true, frame: None, opacity: 1.0 }
+    }
+
+    #[test]
+    fn iconstack_group_entry_carries_translucency_and_shadow() {
+        let mut group = layer(PART_ICON_GROUP, 7);
+        group.group_style = Some(GroupStyle {
+            translucency_enabled: true,
+            translucency: 0.3,
+            shadow_kind: 3,
+            shadow_opacity: 0.5,
+        });
+        let csi = build_iconstack_csi("s.iconstack", 1024, &[layer(PART_ICON_GRADIENT, 1), group]);
+        let t3fd = word(csi_tlv(&csi), 0x3FD);
+        // count, gradient entry (20 zero bytes), then the group entry.
+        assert_eq!(t3fd.len(), 48);
+        assert!(t3fd[4..24].iter().all(|b| *b == 0));
+        let entry = &t3fd[24..44];
+        assert_eq!(u32::from_le_bytes(entry[4..8].try_into().unwrap()), 1);
+        assert_eq!(f32::from_le_bytes(entry[8..12].try_into().unwrap()), 0.3);
+        assert_eq!(u32::from_le_bytes(entry[12..16].try_into().unwrap()), 3);
+        assert_eq!(f32::from_le_bytes(entry[16..20].try_into().unwrap()), 0.5);
+        // 0x3FE: count + 12 zero bytes per layer + 4-byte trailer.
+        assert_eq!(word(csi_tlv(&csi), 0x3FE).len(), 4 + 2 * 12 + 4);
+    }
+
+    #[test]
+    fn icongroup_entry_records_frame_opacity_and_glass() {
+        let mut l = layer(PART_REGULAR, 9);
+        l.frame = Some((-11, -2, 1044, 1028));
+        l.opacity = 0.0;
+        l.glass = false;
+        let csi = build_icongroup_csi("IconGroup", 1024, &[l]);
+        let tlv = csi_tlv(&csi);
+        let t3f4 = word(tlv, 0x3F4);
+        let rd = |o: usize| i32::from_le_bytes(t3f4[o..o + 4].try_into().unwrap());
+        assert_eq!((rd(12), rd(16), rd(20), rd(24)), (-11, -2, 1044, 1028));
+        assert_eq!(f32::from_le_bytes(t3f4[32..36].try_into().unwrap()), 0.0);
+        let t3fc = word(tlv, 0x3FC);
+        assert_eq!(u32::from_le_bytes(t3fc[8..12].try_into().unwrap()), 0, "glass off");
+        assert_eq!(word(tlv, 0x3FE).len(), 4 + 12 + 4);
     }
 }

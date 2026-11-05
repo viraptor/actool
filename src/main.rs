@@ -11,8 +11,8 @@ const SHORT_BUNDLE_VERSION: &str = "26.3";
 #[derive(Parser, Debug)]
 #[command(name = "actool", about = "Compiles, prints, updates, and verifies asset catalogs.")]
 struct Cli {
-    /// Path to .xcassets document
-    document: Option<PathBuf>,
+    /// Path(s) to .xcassets document(s)
+    document: Vec<PathBuf>,
 
     /// Output format
     #[arg(long, default_value = "xml1",
@@ -54,6 +54,11 @@ struct Cli {
 
     #[arg(long, default_value = "11.0")]
     minimum_deployment_target: String,
+
+    /// Override the CoreUI format version written into the CAR header.
+    /// Defaults to the host CoreUI framework version on macOS, otherwise 972.
+    #[arg(long)]
+    coreui_version: Option<u32>,
 
     #[arg(long, action = clap::ArgAction::Append, default_value = "")]
     target_device: Vec<String>,
@@ -107,14 +112,15 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let Some(document) = cli.document.clone() else {
+    if cli.document.is_empty() {
         eprintln!("error: a document path is required");
         return ExitCode::from(2);
-    };
+    }
+    let documents = cli.document.clone();
 
     if cli.print_contents && cli.compile.is_none() {
         match catalog::AssetCatalog::new(
-            document.clone(),
+            documents[0].clone(),
             cli.platform.clone(),
             cli.minimum_deployment_target.clone(),
             None,
@@ -147,7 +153,7 @@ fn main() -> ExitCode {
         (cli.generate_objc_asset_symbols.as_ref(), cli.bundle_identifier.as_ref())
     {
         if let Err(e) = symbols::generate_symbols_header(
-            &document,
+            &documents[0],
             header_path,
             bundle_id,
             &cli.platform,
@@ -158,7 +164,7 @@ fn main() -> ExitCode {
         let mut output_files: Vec<PathBuf> = Vec::new();
         if let Some(index_path) = cli.generate_asset_symbol_index.as_ref() {
             if let Err(e) =
-                symbols::generate_symbol_index(&document, index_path, &cli.platform)
+                symbols::generate_symbol_index(&documents[0], index_path, &cli.platform)
             {
                 eprintln!("error generating index: {e}");
                 return ExitCode::from(1);
@@ -171,7 +177,7 @@ fn main() -> ExitCode {
             std::fs::canonicalize(header_path).unwrap_or_else(|_| header_path.clone()),
         );
         if let Some(dep) = cli.export_dependency_info.as_ref() {
-            if let Err(e) = write_dependency_info(dep, &document, &output_files) {
+            if let Err(e) = write_dependency_info(dep, &documents, &output_files) {
                 eprintln!("error writing deps: {e}");
                 return ExitCode::from(1);
             }
@@ -194,10 +200,15 @@ fn main() -> ExitCode {
         "NO"
     );
 
-    // Dispatch to icon bundle handler when the document is a .icon bundle
-    let output_files = if icon_bundle::is_icon_bundle(&document) {
-        match icon_bundle::compile_icon_bundle(
-            &document,
+    // Dispatch to icon bundle handler when there is exactly one document and it
+    // is a .icon bundle; otherwise compile all provided asset catalogs together.
+    let output_files = if documents.len() == 1 && icon_bundle::is_icon_bundle(&documents[0]) {
+        let options = icon_bundle::IconCompileOptions {
+            coreui_version: Some(compiler::resolve_coreui_version(&cli.platform, cli.coreui_version)),
+            target_devices: cli.target_device.iter().filter(|d| !d.is_empty()).cloned().collect(),
+        };
+        match icon_bundle::compile_icon_bundle_with_options(
+            &documents[0],
             &compile_dir,
             &cli.platform,
             &cli.minimum_deployment_target,
@@ -205,16 +216,21 @@ fn main() -> ExitCode {
             cli.output_partial_info_plist.as_deref(),
             cli.accent_color.as_deref(),
             &cli.standalone_icon_behavior,
+            &options,
         ) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("error compiling icon bundle: {e}");
+                if let Some(missing) = e.downcast_ref::<icon_bundle::NoMatchingAppIcon>() {
+                    print_compilation_error(&cli.output_format, &missing.document, &missing.to_string(), &missing.output_files);
+                } else {
+                    eprintln!("error compiling icon bundle: {e}");
+                }
                 return ExitCode::from(1);
             }
         }
     } else {
         match compiler::compile_catalog(
-            &document,
+            &documents,
             &compile_dir,
             &cli.platform,
             &cli.minimum_deployment_target,
@@ -226,6 +242,7 @@ fn main() -> ExitCode {
             include_languages,
             cli.development_region.clone(),
             plist_l10n,
+            cli.coreui_version,
         ) {
             Ok(f) => f,
             Err(e) => {
@@ -236,7 +253,7 @@ fn main() -> ExitCode {
     };
 
     if let Some(dep) = cli.export_dependency_info.as_ref() {
-        if let Err(e) = write_dependency_info(dep, &document, &output_files) {
+        if let Err(e) = write_dependency_info(dep, &documents, &output_files) {
             eprintln!("error writing deps: {e}");
             return ExitCode::from(1);
         }
@@ -278,6 +295,48 @@ fn print_plist_xml(_top_key: &str, _body: &str) {
     // of the rewrite's first milestone.
 }
 
+/// actool's report for a failed compile: the error plus whatever outputs were
+/// still written (the partial plist).
+fn print_compilation_error(
+    format: &str,
+    document: &Path,
+    message: &str,
+    output_files: &[PathBuf],
+) {
+    if format == "human-readable-text" {
+        println!("/* com.apple.actool.errors */");
+        println!("{}: error: {message}", document.display());
+        println!("/* com.apple.actool.compilation-results */");
+        for f in output_files {
+            println!("{}", f.display());
+        }
+        println!();
+        return;
+    }
+    println!(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    println!(r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#);
+    println!(r#"<plist version="1.0">"#);
+    println!("<dict>");
+    println!("\t<key>com.apple.actool.compilation-results</key>");
+    println!("\t<dict>");
+    println!("\t\t<key>output-files</key>");
+    println!("\t\t<array>");
+    for f in output_files {
+        println!("\t\t\t<string>{}</string>", f.display());
+    }
+    println!("\t\t</array>");
+    println!("\t</dict>");
+    println!("\t<key>com.apple.actool.errors</key>");
+    println!("\t<array>");
+    println!("\t\t<dict>");
+    println!("\t\t\t<key>description</key>");
+    println!("\t\t\t<string>{message}</string>");
+    println!("\t\t</dict>");
+    println!("\t</array>");
+    println!("</dict>");
+    println!("</plist>");
+}
+
 fn print_compilation_results(format: &str, output_files: &[PathBuf]) {
     if format == "human-readable-text" {
         println!("/* com.apple.actool.compilation-results */");
@@ -310,18 +369,20 @@ fn print_compilation_results(format: &str, output_files: &[PathBuf]) {
 
 fn write_dependency_info(
     path: &Path,
-    xcassets_path: &Path,
+    xcassets_paths: &[PathBuf],
     output_files: &[PathBuf],
 ) -> std::io::Result<()> {
     let mut out: Vec<u8> = Vec::new();
     out.push(0x00);
     out.extend_from_slice(format!("actool-{BUNDLE_VERSION}").as_bytes());
     out.push(0x00);
-    let abs_input = std::fs::canonicalize(xcassets_path)
-        .unwrap_or_else(|_| xcassets_path.to_path_buf());
-    out.push(0x10);
-    out.extend_from_slice(abs_input.to_string_lossy().as_bytes());
-    out.push(0x00);
+    for xcassets_path in xcassets_paths {
+        let abs_input = std::fs::canonicalize(xcassets_path)
+            .unwrap_or_else(|_| xcassets_path.to_path_buf());
+        out.push(0x10);
+        out.extend_from_slice(abs_input.to_string_lossy().as_bytes());
+        out.push(0x00);
+    }
     for f in output_files {
         out.push(0x40);
         out.extend_from_slice(f.to_string_lossy().as_bytes());

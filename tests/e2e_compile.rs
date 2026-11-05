@@ -27,7 +27,7 @@ fn compile_reference_catalog_produces_outputs() {
     let out = workspace_tmp("rust_e2e_full");
     let plist = out.join("AppIcon.Info.plist");
     let files = compiler::compile_catalog(
-        &ref_catalog(),
+        &[ref_catalog()],
         &out,
         "macosx",
         "11.0",
@@ -39,6 +39,7 @@ fn compile_reference_catalog_produces_outputs() {
         None,
         None,
         true,
+        None,
     )
     .expect("compile");
     assert!(files.iter().any(|p| p.ends_with("Assets.car")));
@@ -59,7 +60,7 @@ fn compile_reference_catalog_without_icon() {
     }
     let out = workspace_tmp("rust_e2e_no_icon");
     let files = compiler::compile_catalog(
-        &ref_catalog(),
+        &[ref_catalog()],
         &out,
         "macosx",
         "11.0",
@@ -71,6 +72,7 @@ fn compile_reference_catalog_without_icon() {
         None,
         None,
         true,
+        None,
     )
     .expect("compile");
     assert!(files.iter().any(|p| p.ends_with("Assets.car")));

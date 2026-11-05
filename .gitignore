@@ -23,3 +23,4 @@ tools/validate_car
 
 # Third-party repos cloned by validate_repos.py
 third_party/
+.worktrees/

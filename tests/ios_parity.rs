@@ -56,7 +56,7 @@ fn build_mixed_catalog(root: &Path) {
 fn compile_ios(xcassets: &Path, out: &Path) {
     let plist = out.join("partial.plist");
     compiler::compile_catalog(
-        xcassets,
+        &[xcassets.to_path_buf()],
         out,
         "iphoneos",
         "14.0",
@@ -68,6 +68,7 @@ fn compile_ios(xcassets: &Path, out: &Path) {
         None,
         None,
         true,
+        Some(975),
     )
     .expect("compile");
 }
@@ -101,7 +102,7 @@ fn build_appicon_catalog(root: &Path, entries: &[(&str, &str, &str)]) {
 fn compile_ios_icon(xcassets: &Path, out: &Path) {
     let plist = out.join("partial.plist");
     compiler::compile_catalog(
-        xcassets,
+        &[xcassets.to_path_buf()],
         out,
         "iphoneos",
         "14.0",
@@ -113,6 +114,7 @@ fn compile_ios_icon(xcassets: &Path, out: &Path) {
         None,
         None,
         true,
+        Some(975),
     )
     .expect("compile");
 }
@@ -518,4 +520,140 @@ fn ios_appicon_no_subtype_without_60pt_at_3x() {
         }
     }
     assert!(!any_1792, "no subtype-1792 expected without a 60pt@3x icon");
+}
+
+#[test]
+fn ios_appicon_single_size() {
+    let root = workspace_tmp("ios_appicon_single_size");
+    let xc = root.join("A.xcassets");
+    let set = xc.join("AppIcon.appiconset");
+    std::fs::create_dir_all(&set).unwrap();
+    std::fs::write(
+        xc.join("Contents.json"),
+        r#"{"info":{"author":"xcode","version":1}}"#,
+    )
+    .unwrap();
+    write_png(&set.join("Icon.png"), 1024, 1024, [64, 128, 192, 255]);
+    std::fs::write(
+        set.join("Contents.json"),
+        r#"{
+          "images":[{"filename":"Icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],
+          "info":{"author":"xcode","version":1}
+        }"#,
+    )
+    .unwrap();
+
+    let out = root.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    compile_ios_icon(&xc, &out);
+
+    let car = std::fs::read(out.join("Assets.car")).expect("car");
+    let kf = keyformat(&car);
+    assert_eq!(kf, vec![7, 13, 12, 15, 16, 9, 17, 1, 2]);
+
+    // Modern iOS actool uses CoreUI 975 / key-semantics 2 even for single-size
+    // app icons.
+    let h = car.windows(4).position(|w| w == b"RATC").expect("CARHEADER");
+    assert_eq!(read_u32_le(&car, h + 4), 975, "single-size CoreUI version");
+    assert_eq!(read_u32_le(&car, h + 432), 2, "single-size key semantics");
+
+    let scale_col = kf.iter().position(|t| *t == 12).unwrap();
+    let idiom_col = kf.iter().position(|t| *t == 15).unwrap();
+    let d2_col = kf.iter().position(|t| *t == 9).unwrap();
+    let part_col = kf.iter().position(|t| *t == 2).unwrap();
+
+    let mut seen = std::collections::HashSet::new();
+    for i in (0..car.len().saturating_sub(kf.len() * 2)).step_by(2) {
+        let c: Vec<u16> = (0..kf.len())
+            .map(|x| u16::from_le_bytes(car[i + x * 2..i + x * 2 + 2].try_into().unwrap()))
+            .collect();
+        if c[0] == 0
+            && c[1] == 0
+            && c[scale_col] == 1
+            && c[d2_col] == 1
+            && c[part_col] == 220
+        {
+            seen.insert(c[idiom_col]);
+        }
+    }
+    assert!(seen.contains(&1), "expected phone idiom rendition");
+    assert!(seen.contains(&2), "expected pad idiom rendition");
+
+    // Loose home-screen PNGs are emitted (scaled from the 1024 source).
+    assert!(out.join("AppIcon60x60@2x.png").exists());
+    assert!(out.join("AppIcon76x76@2x~ipad.png").exists());
+
+    let plist = std::fs::read_to_string(out.join("partial.plist")).unwrap();
+    assert!(plist.contains("<key>CFBundleIcons</key>"));
+    assert!(plist.contains("<key>CFBundleIcons~ipad</key>"));
+    assert!(plist.contains("<string>AppIcon60x60</string>"));
+    assert!(plist.contains("<string>AppIcon76x76</string>"));
+}
+
+#[test]
+fn ios_appicon_filters_mac_idioms_from_mixed_set() {
+    // A real Xcode project often keeps iOS and macOS app icons in the same
+    // .appiconset. `/usr/bin/actool --platform iphoneos` ignores the mac
+    // entries; our compiler must do the same.
+    let root = workspace_tmp("ios_appicon_mac_filter");
+    let xc = root.join("A.xcassets");
+    let set = xc.join("AppIcon.appiconset");
+    std::fs::create_dir_all(&set).unwrap();
+    std::fs::write(
+        xc.join("Contents.json"),
+        r#"{"info":{"author":"xcode","version":1}}"#,
+    )
+    .unwrap();
+
+    // iOS single-size source plus a handful of macOS icon sizes.
+    write_png(&set.join("icon-ios-1024.png"), 1024, 1024, [64, 128, 192, 255]);
+    write_png(&set.join("icon-mac-16.png"), 16, 16, [255, 0, 0, 255]);
+    write_png(&set.join("icon-mac-16@2x.png"), 32, 32, [255, 0, 0, 255]);
+    write_png(&set.join("icon-mac-32.png"), 32, 32, [255, 0, 0, 255]);
+    write_png(&set.join("icon-mac-32@2x.png"), 64, 64, [255, 0, 0, 255]);
+
+    std::fs::write(
+        set.join("Contents.json"),
+        r#"{
+          "images":[
+            {"filename":"icon-ios-1024.png","idiom":"universal","platform":"ios","size":"1024x1024"},
+            {"filename":"icon-mac-16.png","idiom":"mac","scale":"1x","size":"16x16"},
+            {"filename":"icon-mac-16@2x.png","idiom":"mac","scale":"2x","size":"16x16"},
+            {"filename":"icon-mac-32.png","idiom":"mac","scale":"1x","size":"32x32"},
+            {"filename":"icon-mac-32@2x.png","idiom":"mac","scale":"2x","size":"32x32"}
+          ],
+          "info":{"author":"xcode","version":1}
+        }"#,
+    )
+    .unwrap();
+
+    let out = root.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    compile_ios_icon(&xc, &out);
+
+    let car = std::fs::read(out.join("Assets.car")).expect("car");
+    let kf = keyformat(&car);
+    let scale_col = kf.iter().position(|t| *t == 12).unwrap();
+    let idiom_col = kf.iter().position(|t| *t == 15).unwrap();
+    let d2_col = kf.iter().position(|t| *t == 9).unwrap();
+    let part_col = kf.iter().position(|t| *t == 2).unwrap();
+
+    // Single-size iOS should produce exactly two Icon Image renditions,
+    // one for phone (1) and one for pad (2). The mac entries must not leak
+    // in as idiom 0 / universal renditions.
+    let mut seen_idioms = std::collections::HashSet::new();
+    for i in (0..car.len().saturating_sub(kf.len() * 2)).step_by(2) {
+        let c: Vec<u16> = (0..kf.len())
+            .map(|x| u16::from_le_bytes(car[i + x * 2..i + x * 2 + 2].try_into().unwrap()))
+            .collect();
+        if c[0] == 0
+            && c[1] == 0
+            && c[scale_col] == 1
+            && c[d2_col] == 1
+            && c[part_col] == 220
+        {
+            seen_idioms.insert(c[idiom_col]);
+        }
+    }
+    assert_eq!(seen_idioms, std::collections::HashSet::from([1u16, 2u16]));
 }
