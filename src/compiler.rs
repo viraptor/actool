@@ -71,7 +71,7 @@ fn detect_host_coreui_version() -> Option<u32> {
 /// 2. `ACTOOL_COREUI_VERSION` environment variable.
 /// 3. Host CoreUI framework version on macOS.
 /// 4. Sensible default based on the target platform.
-fn resolve_coreui_version(_platform: &str, explicit: Option<u32>) -> u32 {
+pub fn resolve_coreui_version(_platform: &str, explicit: Option<u32>) -> u32 {
     if let Some(v) = explicit {
         return v;
     }
@@ -832,11 +832,6 @@ fn ios_icon_files(icons: &[IconImage], name: &str, idiom: &str) -> Vec<String> {
 /// idiom has home-screen icons — `CFBundleIconFiles`. The iPad list inherits
 /// the iPhone primaries (iPad falls back to them), matching host actool.
 fn write_ios_icon_plist(path: &Path, name: &str, icons: &[IconImage]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
     let iphone_files = ios_icon_files(icons, name, "iphone");
     // iPad lists its own primary (preceded by the iPhone fallback) only when it
     // actually ships an iPad icon; with no iPad icons the dict carries just the
@@ -850,13 +845,31 @@ fn write_ios_icon_plist(path: &Path, name: &str, icons: &[IconImage]) -> Result<
         v
     };
 
+    write_ios_icon_plist_files(path, name, &iphone_files, &ipad_files, (true, true))
+}
+
+/// Write the iOS partial plist from already-resolved `CFBundleIconFiles`
+/// lists (an empty list omits the key). `with_name` says, per idiom
+/// (iPhone, iPad), whether the dict also carries `CFBundleIconName`.
+pub fn write_ios_icon_plist_files(
+    path: &Path,
+    name: &str,
+    iphone_files: &[String],
+    ipad_files: &[String],
+    with_name: (bool, bool),
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
     let mut lines = vec![
         r#"<?xml version="1.0" encoding="UTF-8"?>"#.to_string(),
         r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#.to_string(),
         r#"<plist version="1.0">"#.to_string(),
         "<dict>".to_string(),
     ];
-    let mut emit_primary = |key: &str, files: &[String]| {
+    let mut emit_primary = |key: &str, files: &[String], with_name: bool| {
         lines.push(format!("\t<key>{key}</key>"));
         lines.push("\t<dict>".to_string());
         lines.push("\t\t<key>CFBundlePrimaryIcon</key>".to_string());
@@ -869,13 +882,15 @@ fn write_ios_icon_plist(path: &Path, name: &str, icons: &[IconImage]) -> Result<
             }
             lines.push("\t\t\t</array>".to_string());
         }
-        lines.push("\t\t\t<key>CFBundleIconName</key>".to_string());
-        lines.push(format!("\t\t\t<string>{name}</string>"));
+        if with_name {
+            lines.push("\t\t\t<key>CFBundleIconName</key>".to_string());
+            lines.push(format!("\t\t\t<string>{name}</string>"));
+        }
         lines.push("\t\t</dict>".to_string());
         lines.push("\t</dict>".to_string());
     };
-    emit_primary("CFBundleIcons", &iphone_files);
-    emit_primary("CFBundleIcons~ipad", &ipad_files);
+    emit_primary("CFBundleIcons", iphone_files, with_name.0);
+    emit_primary("CFBundleIcons~ipad", ipad_files, with_name.1);
     lines.push("</dict>".to_string());
     lines.push("</plist>".to_string());
     lines.push(String::new());
